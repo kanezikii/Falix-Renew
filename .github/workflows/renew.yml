@@ -1,0 +1,62 @@
+name: Falix Renew Pro
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 2,8,14,20 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Restore Falix login state
+        env:
+          FALIX_STATE_B64: ${{ secrets.FALIX_STATE_B64 }}
+        run: |
+          echo "$FALIX_STATE_B64" | base64 -d > falix_state.json
+          chmod 600 falix_state.json
+
+      - name: Run Falix Renew
+        env:
+          FALIX_SERVERS: ${{ secrets.FALIX_SERVERS }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          FALIX_STORAGE_STATE: falix_state.json
+          HEADLESS: "true"
+          RENEW_BELOW_MINUTES: "30"
+          CAPTCHA_WAIT_SECONDS: "60"
+        run: |
+          python falix_renew.py
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: falix-debug
+          path: debug_output/
+          if-no-files-found: ignore
+          retention-days: 7
