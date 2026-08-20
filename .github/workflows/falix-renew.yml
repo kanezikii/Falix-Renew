@@ -1,61 +1,201 @@
-name: Falix Renew Pro
+﻿name: Falix Renew Pro
 
 on:
   workflow_dispatch:
-
   schedule:
-    # 每 6 小时检查一次
     - cron: "17 */6 * * *"
 
 permissions:
   contents: read
 
+concurrency:
+  group: falix-renew
+  cancel-in-progress: false
+
 jobs:
   renew:
+    name: Falix Auto Renew
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
-    timeout-minutes: 15
+    env:
+      PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Get Playwright version
+        id: playwright-version
+        shell: bash
+        run: |
+          VERSION=$(python - <<'PY'
+          import importlib.metadata
+          print(importlib.metadata.version("playwright"))
+          PY
+          )
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Playwright version: $VERSION"
+
+      - name: Cache Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+          restore-keys: |
+            playwright-chromium-${{ runner.os }}-
+
+      - name: Install Playwright Chromium
+        run: |
           python -m playwright install --with-deps chromium
 
-      - name: Prepare storage state
+      - name: Validate required secrets
         env:
+          FALIX_SERVER_IDS: ${{ secrets.FALIX_SERVER_IDS }}
           FALIX_STORAGE_STATE_B64: ${{ secrets.FALIX_STORAGE_STATE_B64 }}
+        shell: bash
         run: |
-          if [ -n "$FALIX_STORAGE_STATE_B64" ]; then
-            echo "$FALIX_STORAGE_STATE_B64" | base64 -d > falix_state.json
+          set -e
+
+          if [ -z "$FALIX_SERVER_IDS" ]; then
+            echo "::error::FALIX_SERVER_IDS is missing"
+            exit 1
           fi
 
+          if [ -z "$FALIX_STORAGE_STATE_B64" ]; then
+            echo "::error::FALIX_STORAGE_STATE_B64 is missing"
+            exit 1
+          fi
+
+          echo "FALIX_SERVER_IDS: configured"
+          echo "FALIX_STORAGE_STATE_B64: configured"
+
+      - name: Restore Falix storage state
+        env:
+          FALIX_STORAGE_STATE_B64: ${{ secrets.FALIX_STORAGE_STATE_B64 }}
+        shell: bash
+        run: |
+          set -e
+
+          rm -f falix_state.json
+
+          printf '%s' "$FALIX_STORAGE_STATE_B64" |
+            base64 --decode > falix_state.json
+
+          if [ ! -s falix_state.json ]; then
+            echo "::error::falix_state.json is empty"
+            exit 1
+          fi
+
+          echo "storage_state restored"
+
+      - name: Validate storage state
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("falix_state.json")
+
+          try:
+              data = json.loads(path.read_text(encoding="utf-8"))
+          except Exception as exc:
+              print(f"::error::Invalid storage_state JSON: {exc}")
+              raise SystemExit(1)
+
+          if not isinstance(data, dict):
+              print("::error::storage_state must be a JSON object")
+              raise SystemExit(1)
+
+          print("storage_state JSON: valid")
+
+          if "cookies" in data:
+              print(f"Cookies: {len(data['cookies'])}")
+
+          if "origins" in data:
+              print(f"Origins: {len(data['origins'])}")
+          PY
+
+      - name: Prepare debug directory
+        run: |
+          mkdir -p debug_output
+          rm -f debug_output/* || true
+
       - name: Run Falix Renew
+        id: renew
         env:
           FALIX_SERVER_IDS: ${{ secrets.FALIX_SERVER_IDS }}
           FALIX_STORAGE_STATE: falix_state.json
-
           RENEW_BELOW_MINUTES: "20"
           HEADLESS: "true"
-
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
+          echo "=========================================="
+          echo "Falix Renew Pro"
+          echo "=========================================="
+          echo "Run number: ${{ github.run_number }}"
+          echo "Renew threshold: ${RENEW_BELOW_MINUTES:-20} minutes"
+          echo "Starting renew.py..."
+
           python renew.py
 
-      - name: Upload debug files
+      - name: Generate job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "# Falix Renew Pro"
+            echo
+            echo "## Run information"
+            echo
+            echo "- Run: #${{ github.run_number }}"
+            echo "- Workflow: ${{ github.workflow }}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo
+            echo "## Result"
+            echo
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "✅ **Renew job completed successfully**"
+            else
+              echo "❌ **Renew job failed**"
+            fi
+            echo
+            echo "## Debug"
+            echo
+            if [ -d "debug_output" ]; then
+              COUNT=$(find debug_output -type f | wc -l)
+              echo "Debug files: $COUNT"
+            else
+              echo "debug_output directory not found."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: falix-debug
+          name: falix-debug-${{ github.run_number }}
           path: debug_output/
           if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove storage state
+        if: always()
+        shell: bash
+        run: |
+          rm -f falix_state.json
+          echo "Sensitive storage state removed."
