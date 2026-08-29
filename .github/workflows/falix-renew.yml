@@ -90,15 +90,35 @@ jobs:
 
           rm -f falix_state.json
 
-          printf '%s' "$FALIX_STORAGE_STATE" |
-            base64 --decode > falix_state.json
+          # 兼容两种 secret 内容:
+          # 1) base64 编码的 storage_state JSON (zampto 项目同款格式)
+          # 2) 直接的 storage_state JSON 明文 (Cookie Manager Pro 直接复制)
+          # 先尝试 base64 --decode; 若失败 (invalid input), 假定是明文 JSON.
+          if printf '%s' "$FALIX_STORAGE_STATE" | base64 --decode > falix_state.json 2>/dev/null; then
+            # 解码成功, 校验是否合法 JSON
+            if python3 -c "import json,sys; json.load(open('falix_state.json'))" 2>/dev/null; then
+              echo "storage_state restored (base64-decoded)"
+            else
+              echo "::error::base64 decoded but not valid JSON"
+              exit 1
+            fi
+          else
+            # base64 解码失败, 假定 secret 是明文 JSON, 直接写入
+            printf '%s' "$FALIX_STORAGE_STATE" > falix_state.json
+            if python3 -c "import json,sys; json.load(open('falix_state.json'))" 2>/dev/null; then
+              echo "storage_state restored (plain JSON)"
+            else
+              echo "::error::neither base64 nor valid JSON"
+              exit 1
+            fi
+          fi
 
           if [ ! -s falix_state.json ]; then
             echo "::error::falix_state.json is empty"
             exit 1
           fi
 
-          echo "storage_state restored"
+          echo "storage_state ready"
 
       - name: Validate storage state
         run: |
@@ -114,9 +134,50 @@ jobs:
               print(f"::error::Invalid storage_state JSON: {exc}")
               raise SystemExit(1)
 
+          # 兼容两种格式:
+          # 1) Playwright storage_state: {"cookies": [...], "origins": [...]}
+          # 2) Cookie Manager Pro 导出的裸数组: [{...}, {...}]
+          # 如果是裸数组, 自动包装成 Playwright 格式
+          if isinstance(data, list):
+              print(f"Detected raw cookie array ({len(data)} cookies), wrapping into Playwright storage_state format")
+              data = {"cookies": data, "origins": []}
+
           if not isinstance(data, dict):
-              print("::error::storage_state must be a JSON object")
+              print("::error::storage_state must be a JSON object or array")
               raise SystemExit(1)
+
+          # Cookie 字段转换: Cookie Manager Pro 格式 -> Playwright 格式
+          # Cookie Manager Pro: name, value, domain, path, expirationDate, hostOnly,
+          #                     httpOnly, secure, session, storeId, sameSite
+          # Playwright:         name, value, domain, path, expires, httpOnly,
+          #                     secure, sameSite
+          SAMESITE_MAP = {
+              "unspecified": "None",   # Playwright 不接受 unspecified, 用 None 兜底
+              "no_restriction": "None",
+              "lax": "Lax",
+              "strict": "Strict",
+              "none": "None",
+          }
+          converted = 0
+          for c in data.get("cookies", []):
+              # expirationDate -> expires (int, -1 表示 session cookie)
+              if "expirationDate" in c and "expires" not in c:
+                  ed = c.pop("expirationDate")
+                  try:
+                      c["expires"] = int(ed) if ed else -1
+                  except (TypeError, ValueError):
+                      c["expires"] = -1
+                  converted += 1
+              # 移除 Playwright 不识别的字段 (保留也无害, 但干净点)
+              for k in ("hostOnly", "storeId", "session"):
+                  c.pop(k, None)
+              # sameSite 大小写规范化
+              ss = c.get("sameSite")
+              if isinstance(ss, str):
+                  c["sameSite"] = SAMESITE_MAP.get(ss.lower(), ss)
+          if converted:
+              print(f"Converted {converted} cookies from Cookie Manager Pro format")
+              path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
           print("storage_state JSON: valid")
 
