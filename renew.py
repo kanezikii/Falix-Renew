@@ -428,6 +428,35 @@ def format_seconds(seconds):
 # ============================================================
 
 async def detect_captcha(page):
+    """检测页面是否还在 CAPTCHA/Challenge 状态.
+
+    返回 True 表示仍有 CAPTCHA 需要处理, False 表示已通过或没有 CAPTCHA.
+
+    关键: 如果 cf-turnstile-response hidden input 已有 value, 说明 CF 已发放
+    response token, Turnstile 已通过 - 即便 cf-turnstile div 和 iframe 仍在 DOM 里
+    (它们不会消失, 只是 widget 显示成绿色对勾).
+    """
+    # 1. 优先检查 cf-turnstile-response 是否已有 value (Turnstile 通过的硬标志)
+    try:
+        has_response = await page.evaluate("""
+        (() => {
+            const inputs = document.querySelectorAll(
+                'input[name="cf-turnstile-response"], input[id*="cf-chl-widget"][name="cf-turnstile-response"]'
+            );
+            for (const inp of inputs) {
+                if (inp.value && inp.value.length > 10) {
+                    return true;
+                }
+            }
+            return false;
+        })();
+""")
+        if has_response:
+            return False  # Turnstile 已通过, 不算 CAPTCHA 待处理
+    except Exception:
+        pass
+
+    # 2. 文本关键字检测 (会话挑战页 / "Just a moment" 等仍含这些词)
     patterns = [
         "captcha",
         "turnstile",
@@ -441,10 +470,27 @@ async def detect_captcha(page):
         await get_body_text(page)
     ).lower()
 
+    # 3. "Just a moment..." / "Performing security verification" 是 CF Managed
+    # Challenge 全屏页的特征, 这种情况 widget 不会有 response (CF 边缘层挑战,
+    # 通过后会自动 redirect 到目标页, 不会留下 turnstile-response token)
+    managed_challenge_text = any(
+        phrase in text for phrase in [
+            "just a moment",
+            "performing security verification",
+            "this website uses a security service",
+        ]
+    )
+
     for pattern in patterns:
         if pattern in text:
-            return True
+            # 命中关键字, 但除非是 managed challenge 全屏页, 否则可能是
+            # Falix dashboard 自带 Turnstile widget (已经有 response 就不算)
+            if managed_challenge_text:
+                return True
+            # 否则继续看 selector 判断
+            break
 
+    # 4. Selector 检测 (iframe / class)
     selectors = [
         'iframe[src*="turnstile"]',
         'iframe[src*="captcha"]',
@@ -457,6 +503,9 @@ async def detect_captcha(page):
             if await page.locator(
                 selector
             ).count():
+                # selector 命中, 但如果是 Turnstile widget 且其 hidden input
+                # 已有 value, 则不算 (上面已检测并返回 False, 走不到这里)
+                # 走到这里说明 Turnstile widget 还没通过
                 return True
         except Exception:
             pass
