@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   renew:
-    name: Falix Auto Renew
+    name: Falix 自动续期
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -22,21 +22,21 @@ jobs:
       PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: Checkout repository
+      - name: 📦 拉取仓库
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 🐍 配置 Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Install Python dependencies
+      - name: 📦 安装 Python 依赖
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Get Playwright version
+      - name: 🐍 获取 Playwright 版本
         id: playwright-version
         shell: bash
         run: |
@@ -46,9 +46,9 @@ jobs:
           PY
           )
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Playwright version: $VERSION"
+          echo "Playwright 版本: $VERSION"
 
-      - name: Cache Playwright Chromium
+      - name: 💾 缓存 Playwright Chromium
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
@@ -56,11 +56,11 @@ jobs:
           restore-keys: |
             playwright-chromium-${{ runner.os }}-
 
-      - name: Install Playwright Chromium
+      - name: 📦 安装 Playwright Chromium + CloakBrowser stealth Chromium
         run: |
           python -m playwright install --with-deps chromium
           # CloakBrowser 需要单独 ensure_binary (会自动下载 stealth Chromium)
-          python -c "from cloakbrowser import ensure_binary; ensure_binary()" || echo "cloakbrowser ensure_binary failed (may use system Chromium)"
+          python -c "from cloakbrowser import ensure_binary; ensure_binary()" || echo "cloakbrowser ensure_binary 失败 (可能用系统 Chromium 兜底)"
 
       - name: "🌐 启动代理 (sing-box, 多格式: hysteria2/hy2/tuic/vless/vmess)"
         env:
@@ -151,15 +151,15 @@ jobs:
           }
           with open("/tmp/sb_config.json", "w", encoding="utf-8") as f:
               json.dump(cfg, f, indent=2, ensure_ascii=False)
-          print("Protocol:", proto)
-          print("Server:", out.get("server", "?"), ":", out.get("server_port", "?"))
+          print("协议:", proto)
+          print("服务器:", out.get("server", "?"), ":", out.get("server_port", "?"))
           print("SNI:", out.get("tls", {}).get("server_name", ""))
-          print("Insecure:", insecure)
+          print("禁用证书校验:", insecure)
           PYEOF
           echo "--- 生成的配置 ---"
           cat /tmp/sb_config.json
 
-          echo "[2/4] Downloading sing-box ..."
+          echo "[2/4] 下载 sing-box ..."
           SB_VERSION="1.10.7"
           SB_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz"
           curl -fSL "$SB_URL" -o /tmp/sb.tar.gz
@@ -167,38 +167,38 @@ jobs:
           mv /tmp/sing-box-${SB_VERSION}-linux-amd64/sing-box /tmp/sing-box
           chmod +x /tmp/sing-box
 
-          # Validate config before running
-          echo "--- Validating config ---"
-          /tmp/sing-box check -c /tmp/sb_config.json || { echo "[ERROR] sing-box config validation failed"; cat /tmp/sb_config.json; exit 1; }
+          # 启动前校验配置
+          echo "--- 校验 sing-box 配置 ---"
+          /tmp/sing-box check -c /tmp/sb_config.json || { echo "[错误] sing-box 配置校验失败"; cat /tmp/sb_config.json; exit 1; }
 
-          echo "[3/4] Starting sing-box ..."
+          echo "[3/4] 启动 sing-box ..."
           nohup /tmp/sing-box run -c /tmp/sb_config.json > /tmp/sb.log 2>&1 &
           SB_PID=$!
           echo "SB_PID=$SB_PID"
           sleep 8
 
-          echo "--- sing-box log ---"
+          echo "--- sing-box 日志 ---"
           cat /tmp/sb.log || true
           echo "--------------------"
 
-          echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
-          echo "Proxy IP:  $(curl -s --max-time 15 --socks5 127.0.0.1:1080 ifconfig.me || echo 'proxy fail')"
+          echo "直连 IP: $(curl -s --max-time 5 ifconfig.me || echo '失败')"
+          echo "代理 IP: $(curl -s --max-time 15 --socks5 127.0.0.1:1080 ifconfig.me || echo '代理失败')"
 
           # 代理必须可用, 否则后续 CF 必拒
           if curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://www.google.com -o /dev/null; then
             echo "ALL_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
             echo "HTTP_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
             echo "HTTPS_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
-            echo "[OK] Proxy is ready"
+            echo "[OK] 代理已就绪"
           else
-            echo "[ERROR] Proxy is DOWN"
-            echo "---- sing-box log ----"
-            cat /tmp/sb.log 2>/dev/null | tail -30 || echo "no log"
+            echo "[错误] 代理不可用"
+            echo "---- sing-box 日志 ----"
+            cat /tmp/sb.log 2>/dev/null | tail -30 || echo "无日志"
             echo "----------------------"
             exit 1
           fi
 
-      - name: Validate required secrets
+      - name: 🔐 校验必需的 Secrets
         env:
           FALIX_SERVER_IDS: ${{ secrets.FALIX_SERVER_IDS }}
           FALIX_STORAGE_STATE: ${{ secrets.FALIX_STORAGE_STATE }}
@@ -207,19 +207,19 @@ jobs:
           set -e
 
           if [ -z "$FALIX_SERVER_IDS" ]; then
-            echo "::error::FALIX_SERVER_IDS is missing"
+            echo "::error::缺少 FALIX_SERVER_IDS"
             exit 1
           fi
 
           if [ -z "$FALIX_STORAGE_STATE" ]; then
-            echo "::error::FALIX_STORAGE_STATE is missing"
+            echo "::error::缺少 FALIX_STORAGE_STATE"
             exit 1
           fi
 
-          echo "FALIX_SERVER_IDS: configured"
-          echo "FALIX_STORAGE_STATE: configured"
+          echo "FALIX_SERVER_IDS: 已配置"
+          echo "FALIX_STORAGE_STATE: 已配置"
 
-      - name: Restore Falix storage state
+      - name: 📥 还原 Falix 登录会话 (storage_state)
         env:
           FALIX_STORAGE_STATE: ${{ secrets.FALIX_STORAGE_STATE }}
         shell: bash
@@ -235,30 +235,30 @@ jobs:
           if printf '%s' "$FALIX_STORAGE_STATE" | base64 --decode > falix_state.json 2>/dev/null; then
             # 解码成功, 校验是否合法 JSON
             if python3 -c "import json,sys; json.load(open('falix_state.json'))" 2>/dev/null; then
-              echo "storage_state restored (base64-decoded)"
+              echo "storage_state 还原成功 (base64 解码)"
             else
-              echo "::error::base64 decoded but not valid JSON"
+              echo "::error::base64 解码后不是合法 JSON"
               exit 1
             fi
           else
             # base64 解码失败, 假定 secret 是明文 JSON, 直接写入
             printf '%s' "$FALIX_STORAGE_STATE" > falix_state.json
             if python3 -c "import json,sys; json.load(open('falix_state.json'))" 2>/dev/null; then
-              echo "storage_state restored (plain JSON)"
+              echo "storage_state 还原成功 (明文 JSON)"
             else
-              echo "::error::neither base64 nor valid JSON"
+              echo "::error::既不是 base64 也不是合法 JSON"
               exit 1
             fi
           fi
 
           if [ ! -s falix_state.json ]; then
-            echo "::error::falix_state.json is empty"
+            echo "::error::falix_state.json 为空"
             exit 1
           fi
 
-          echo "storage_state ready"
+          echo "storage_state 已就绪"
 
-      - name: Validate storage state
+      - name: 🔍 校验 storage_state 格式并自动转换
         run: |
           python - <<'PY'
           import json
@@ -269,7 +269,7 @@ jobs:
           try:
               data = json.loads(path.read_text(encoding="utf-8"))
           except Exception as exc:
-              print(f"::error::Invalid storage_state JSON: {exc}")
+              print(f"::error::storage_state JSON 无效: {exc}")
               raise SystemExit(1)
 
           # 兼容两种格式:
@@ -277,11 +277,11 @@ jobs:
           # 2) Cookie Manager Pro 导出的裸数组: [{...}, {...}]
           # 如果是裸数组, 自动包装成 Playwright 格式
           if isinstance(data, list):
-              print(f"Detected raw cookie array ({len(data)} cookies), wrapping into Playwright storage_state format")
+              print(f"检测到裸 cookie 数组 ({len(data)} 个 cookie), 自动包装为 Playwright storage_state 格式")
               data = {"cookies": data, "origins": []}
 
           if not isinstance(data, dict):
-              print("::error::storage_state must be a JSON object or array")
+              print("::error::storage_state 必须是 JSON 对象或数组")
               raise SystemExit(1)
 
           # Cookie 字段转换: Cookie Manager Pro 格式 -> Playwright 格式
@@ -314,24 +314,24 @@ jobs:
               if isinstance(ss, str):
                   c["sameSite"] = SAMESITE_MAP.get(ss.lower(), ss)
           if converted:
-              print(f"Converted {converted} cookies from Cookie Manager Pro format")
+              print(f"已转换 {converted} 个 cookie 从 Cookie Manager Pro 格式")
               path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-          print("storage_state JSON: valid")
+          print("storage_state JSON: 合法")
 
           if "cookies" in data:
-              print(f"Cookies: {len(data['cookies'])}")
+              print(f"Cookie 数量: {len(data['cookies'])}")
 
           if "origins" in data:
-              print(f"Origins: {len(data['origins'])}")
+              print(f"Origin 数量: {len(data['origins'])}")
           PY
 
-      - name: Prepare debug directory
+      - name: 🐛 准备调试输出目录
         run: |
           mkdir -p debug_output
           rm -f debug_output/* || true
 
-      - name: Run Falix Renew
+      - name: 🔄 运行 Falix 续期脚本
         id: renew
         env:
           FALIX_SERVER_IDS: ${{ secrets.FALIX_SERVER_IDS }}
@@ -342,58 +342,58 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           echo "=========================================="
-          echo "Falix Renew Pro"
+          echo "Falix Renew Pro (Falix 自动续期)"
           echo "=========================================="
-          echo "Run number: ${{ github.run_number }}"
-          echo "Renew threshold: ${RENEW_BELOW_MINUTES:-20} minutes"
-          echo "Proxy: ${ALL_PROXY:-direct}"
-          echo "Starting renew.py..."
+          echo "运行编号: #${{ github.run_number }}"
+          echo "续期阈值: ${RENEW_BELOW_MINUTES:-20} 分钟"
+          echo "代理: ${ALL_PROXY:-直连}"
+          echo "开始运行 renew.py..."
 
           python renew.py
           PYTHON_EXIT=$?
 
-          # CRITICAL: Clear proxy env vars so subsequent Node.js steps (upload-artifact)
-          # don't try to use SOCKS5 which they don't support
+          # 关键: 清空代理环境变量, 避免后续 Node.js 步骤 (upload-artifact)
+          # 尝试用 SOCKS5 协议 (Node 不支持, 会抛 Invalid URL protocol)
           echo "ALL_PROXY=" >> $GITHUB_ENV
           echo "HTTP_PROXY=" >> $GITHUB_ENV
           echo "HTTPS_PROXY=" >> $GITHUB_ENV
 
           exit $PYTHON_EXIT
 
-      - name: Generate job summary
+      - name: 📝 生成运行摘要
         if: always()
         shell: bash
         run: |
           {
-            echo "# Falix Renew Pro"
+            echo "# Falix Renew Pro (Falix 自动续期)"
             echo
-            echo "## Run information"
+            echo "## 运行信息"
             echo
-            echo "- Run: #${{ github.run_number }}"
-            echo "- Workflow: ${{ github.workflow }}"
-            echo "- Trigger: ${{ github.event_name }}"
-            echo "- Commit: \`${{ github.sha }}\`"
-            echo "- Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- 运行编号: #${{ github.run_number }}"
+            echo "- 工作流: ${{ github.workflow }}"
+            echo "- 触发方式: ${{ github.event_name }}"
+            echo "- 提交: \`${{ github.sha }}\`"
+            echo "- 时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo
-            echo "## Result"
+            echo "## 结果"
             echo
             if [ "${{ job.status }}" = "success" ]; then
-              echo "✅ **Renew job completed successfully**"
+              echo "✅ **续期任务成功完成**"
             else
-              echo "❌ **Renew job failed**"
+              echo "❌ **续期任务失败**"
             fi
             echo
-            echo "## Debug"
+            echo "## 调试"
             echo
             if [ -d "debug_output" ]; then
               COUNT=$(find debug_output -type f | wc -l)
-              echo "Debug files: $COUNT"
+              echo "调试文件数: $COUNT"
             else
-              echo "debug_output directory not found."
+              echo "未找到 debug_output 目录"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload debug artifacts
+      - name: 📸 上传调试截图与 HTML
         if: always()
         uses: actions/upload-artifact@v4
         env:
@@ -411,9 +411,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Remove storage state
+      - name: 🧹 清理敏感 storage_state 文件
         if: always()
         shell: bash
         run: |
           rm -f falix_state.json
-          echo "Sensitive storage state removed."
+          echo "敏感 storage_state 文件已清理."
