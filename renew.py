@@ -437,6 +437,203 @@ async def detect_captcha(page):
 
 
 # ============================================================
+# CAPTCHA / Turnstile 自动通过 (移植自 zampto solve_turnstile)
+# ============================================================
+
+async def find_turnstile_iframe_box(page):
+    """找到 Turnstile / CF Challenge iframe 的 bounding box.
+
+    多策略查找 (按可靠性排序):
+      A. 遍历 page.frames 找到 CF Turnstile frame, 用 frame_element() 拿 DOM 元素
+      B. query_selector 多种 src / title 选择器
+      C. 用 page.evaluate 在页面内遍历所有 iframe, getBoundingClientRect
+    """
+    # 策略 A: 从 page.frames 反查 iframe DOM 元素 (最可靠)
+    try:
+        for fr in page.frames:
+            furl = (fr.url or "").lower()
+            if ("challenges.cloudflare.com" in furl
+                    or "turnstile" in furl
+                    or "captcha" in furl):
+                try:
+                    iframe_el = await fr.frame_element()
+                    if iframe_el:
+                        box = await iframe_el.bounding_box()
+                        if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                            return iframe_el, box
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 策略 B: query_selector 多选择器
+    for sel in [
+        'iframe[src*="challenges.cloudflare.com"]',
+        'iframe[src*="turnstile"]',
+        'iframe[src*="captcha"]',
+        'iframe[src*="cloudflare"]',
+        'div.cf-turnstile iframe',
+        'div[data-sitekey] iframe',
+        'iframe[title*="Widget"]',
+        'iframe[title*="Cloudflare"]',
+        'iframe[title*="captcha"]',
+    ]:
+        try:
+            iframe_el = await page.query_selector(sel)
+            if iframe_el:
+                box = await iframe_el.bounding_box()
+                if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                    return iframe_el, box
+        except Exception:
+            pass
+
+    # 策略 C: 在页面内用 JS 遍历所有 iframe, 拿 boundingClientRect
+    try:
+        js_get_box = """
+        (() => {
+            const iframes = document.querySelectorAll('iframe');
+            const results = [];
+            for (const ifr of iframes) {
+                const r = ifr.getBoundingClientRect();
+                results.push({
+                    src: ifr.src || ifr.getAttribute('src') || '',
+                    title: ifr.title || '',
+                    w: Math.round(r.width), h: Math.round(r.height),
+                    x: Math.round(r.left), y: Math.round(r.top),
+                });
+            }
+            return JSON.stringify(results);
+        })();
+"""
+        result = await page.evaluate(js_get_box)
+        import json as _ij
+        iframe_list = _ij.loads(result) if result else []
+        for ifr in iframe_list:
+            src = (ifr.get("src") or "").lower()
+            title = (ifr.get("title") or "").lower()
+            if (("challenges.cloudflare.com" in src or "turnstile" in src
+                 or "captcha" in src or "widget" in title
+                 or "turnstile" in title or "cloudflare" in title
+                 or "captcha" in title)
+                    and ifr.get("w", 0) > 0 and ifr.get("h", 0) > 0):
+                return None, {
+                    "x": ifr["x"], "y": ifr["y"],
+                    "width": ifr["w"], "height": ifr["h"],
+                }
+    except Exception:
+        pass
+
+    return None, None
+
+
+async def solve_captcha(page, max_wait=90, click_after=8):
+    """等待 CAPTCHA / Turnstile 自动通过; 失败则用坐标点击 iframe 复选框.
+
+    行为:
+      1. 检测到 Turnstile iframe 后, 优先等待自动通过
+      2. iframe 持续存在超过 click_after 秒未消失, 用 page.mouse.click 坐标点击
+         iframe 内复选框位置 (左上区域)
+      3. 点击前做随机鼠标移动 + 短停顿 (拟人化, 避免 CF 检测)
+      4. 第一次点击后等 15s, 不通过再点击不同 offset
+      5. 整个流程上限 max_wait 秒
+
+    跨域 iframe JS 不能 click 内部元素, 但 page.mouse.click 是浏览器层面的
+    合成事件, 直接发 (x, y), 不受同源策略限制, 可"穿透" iframe.
+
+    返回 True 表示验证已通过, False 表示超时仍未通过.
+    """
+    import random as _rand
+    log("🛡️ 等待 CAPTCHA/Turnstile 自动通过 "
+        f"(最长 {max_wait}s, {click_after}s 后尝试坐标点击)...")
+    end_time = time.time() + max_wait
+    iframe_first_seen = None
+    last_click_at = None
+    click_count = 0
+    iframe_ready_logged = False
+
+    while time.time() < end_time:
+        try:
+            # 1. 检查是否还有 Turnstile 痕迹
+            has_frame = False
+            try:
+                for fr in page.frames:
+                    furl = (fr.url or "").lower()
+                    if ("challenges.cloudflare.com" in furl
+                            or "turnstile" in furl
+                            or "captcha" in furl):
+                        has_frame = True
+                        break
+            except Exception:
+                pass
+
+            # 2. 用 detect_captcha 复用判断 (text + selector)
+            has_captcha = await detect_captcha(page)
+
+            # 3. 验证已消失 -> 通过
+            if not has_captcha and not has_frame:
+                if iframe_first_seen:
+                    elapsed = time.time() - iframe_first_seen
+                    log(f"  ✅ CAPTCHA/Turnstile 已通过 (耗时 {elapsed:.1f}s)")
+                else:
+                    log("  ✅ 未出现 CAPTCHA, 无需验证")
+                return True
+
+            # 4. 记录 iframe 首次出现时间
+            if has_frame and iframe_first_seen is None:
+                iframe_first_seen = time.time()
+                log("  📍 CAPTCHA iframe 首次出现")
+
+            # 5. 等待超过 click_after 秒仍未通过 -> 坐标点击
+            if (has_frame and iframe_first_seen is not None
+                    and time.time() - iframe_first_seen >= click_after):
+                iframe_el, box = await find_turnstile_iframe_box(page)
+                if box:
+                    # 3 种 offset 循环: 最左上 / 标准 / 更左上
+                    click_offsets = [
+                        (max(20, box['width'] * 0.08), box['height'] * 0.30),
+                        (max(30, box['width'] * 0.10), box['height'] * 0.40),
+                        (max(15, box['width'] * 0.05), box['height'] * 0.25),
+                    ]
+                    off = click_offsets[click_count % len(click_offsets)]
+                    target_x = box['x'] + off[0]
+                    target_y = box['y'] + off[1]
+                    try:
+                        # 拟人化: 先随机移动几下, 短停顿, 再点击
+                        for _ in range(2):
+                            await page.mouse.move(
+                                box['x'] + _rand.uniform(50, max(100, box['width'])),
+                                box['y'] + _rand.uniform(20, max(40, box['height'])),
+                            )
+                            await asyncio.sleep(_rand.uniform(0.2, 0.5))
+                        await asyncio.sleep(_rand.uniform(0.3, 0.8))
+                        await page.mouse.click(target_x, target_y)
+                        last_click_at = time.time()
+                        click_count += 1
+                        log(f"  🖱️ 第 {click_count} 次坐标点击 CAPTCHA checkbox "
+                            f"({target_x:.0f}, {target_y:.0f}) "
+                            f"(iframe {box['width']:.0f}x{box['height']:.0f} "
+                            f"offset {off[0]:.2f},{off[1]:.2f})")
+                    except Exception as e:
+                        log(f"  ⚠️ 坐标点击失败: {e}")
+                    # 第一次点击后等 15s 再决定是否重试
+                    if click_count == 1:
+                        await asyncio.sleep(15)
+                        continue
+
+            await asyncio.sleep(3)
+        except Exception as e:
+            log(f"  ⚠️ CAPTCHA 等待异常: {e}")
+            await asyncio.sleep(2)
+
+    # 超时退出
+    if last_click_at:
+        log(f"⏰ CAPTCHA 已点击 {click_count} 次但 {max_wait}s 内仍未通过")
+    else:
+        log(f"⏰ CAPTCHA 验证超时 ({max_wait}s), 未能自动通过也未尝试点击")
+    return False
+
+
+# ============================================================
 # Login detection
 # ============================================================
 
@@ -690,25 +887,44 @@ async def process_server(
 
         return False
 
-    # CAPTCHA
+    # CAPTCHA - 自动尝试通过 (移植自 zampto solve_turnstile)
     if await detect_captcha(page):
-        log(
-            "🛡️ 检测到 CAPTCHA / Turnstile"
-        )
+        log("🛡️ 检测到 CAPTCHA / Turnstile, 尝试自动通过...")
 
-        await save_debug(
-            page,
-            server_id,
-            "captcha",
-        )
+        await save_debug(page, server_id, "captcha_before")
 
-        send_tg(
-            "⚠️ Falix 检测到 CAPTCHA\n"
-            f"Server ID: {server_id}\n"
-            "本轮没有尝试绕过验证。"
-        )
+        # 尝试自动通过 CAPTCHA (先等自动通过, 失败则坐标点击 iframe)
+        captcha_ok = await solve_captcha(page, max_wait=90, click_after=8)
 
-        return False
+        if not captcha_ok:
+            log("❌ CAPTCHA 自动通过失败 (90s 内未通过)")
+
+            await save_debug(page, server_id, "captcha_failed")
+
+            send_tg(
+                "⚠️ Falix CAPTCHA 自动通过失败\n"
+                f"Server ID: {server_id}\n"
+                "已尝试坐标点击 iframe checkbox (90s), 仍无法通过."
+            )
+
+            return False
+
+        log("✅ CAPTCHA 已自动通过, 继续检查 Timer")
+
+        await save_debug(page, server_id, "captcha_passed")
+
+        # 通过后重新检查登录状态 (有时 CF 通过会跳转回登录页)
+        if not await check_login(page):
+            log("❌ CAPTCHA 通过后 Falix 登录状态失效")
+
+            await save_debug(page, server_id, "login_required_after_captcha")
+
+            send_tg(
+                "❌ Falix 登录状态失效 (CAPTCHA 通过后)\n"
+                f"Server ID: {server_id}"
+            )
+
+            return False
 
     before = (
         await get_remaining_seconds(
@@ -775,25 +991,30 @@ async def process_server(
         2000
     )
 
-    # 点击后可能出现验证
+    # 点击后可能出现验证 - 自动尝试通过
     if await detect_captcha(page):
-        log(
-            "🛡️ 点击后出现 CAPTCHA"
-        )
+        log("🛡️ 点击 Add Time 后出现 CAPTCHA, 尝试自动通过...")
 
-        await save_debug(
-            page,
-            server_id,
-            "captcha_after_click",
-        )
+        await save_debug(page, server_id, "captcha_after_click_before")
 
-        send_tg(
-            "⚠️ Falix 点击 Add Time "
-            "后出现 CAPTCHA\n"
-            f"Server ID: {server_id}"
-        )
+        captcha_ok = await solve_captcha(page, max_wait=90, click_after=8)
 
-        return False
+        if not captcha_ok:
+            log("❌ 点击后 CAPTCHA 自动通过失败 (90s 内未通过)")
+
+            await save_debug(page, server_id, "captcha_after_click_failed")
+
+            send_tg(
+                "⚠️ Falix 点击 Add Time 后 CAPTCHA 自动通过失败\n"
+                f"Server ID: {server_id}\n"
+                "已尝试坐标点击 iframe checkbox (90s), 仍无法通过."
+            )
+
+            return False
+
+        log("✅ 点击后 CAPTCHA 已自动通过, 验证续期结果")
+
+        await save_debug(page, server_id, "captcha_after_click_passed")
 
     # Verify
     success = await wait_timer_change(
@@ -1004,7 +1225,12 @@ async def main():
     )
 
     if success != len(results):
-        sys.exit(1)
+        # 用 os._exit 替代 sys.exit: 避免 Playwright event loop 在退出时
+        # 干扰 SystemExit, 导致 exit code 非 0 (zampto 项目同款修复)
+        os._exit(1)
+
+    # 全部成功也用 os._exit(0), 保证 workflow 显示 success
+    os._exit(0)
 
 
 if __name__ == "__main__":
