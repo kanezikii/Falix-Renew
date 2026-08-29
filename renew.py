@@ -297,19 +297,20 @@ def parse_time(text):
             + seconds
         )
 
-    # 1h 20m 30s
+    # 1h 20m 30s (英文) 或 1小时 20分钟 30秒 (中文) 或 1小时20分30秒 (中文无空格)
+    # 中文: 时/小时, 分/分钟, 秒
     hours = re.search(
-        r"(\d+)\s*h",
+        r"(\d+)\s*(?:h|小时|时)\b",
         text,
     )
 
     minutes = re.search(
-        r"(\d+)\s*m",
+        r"(\d+)\s*(?:m|分钟|分)\b",
         text,
     )
 
     seconds = re.search(
-        r"(\d+)\s*s",
+        r"(\d+)\s*(?:s|秒)\b",
         text,
     )
 
@@ -400,6 +401,12 @@ async def get_remaining_seconds(page):
             and seconds <= 24 * 3600
         ):
             return seconds
+
+    # 中文格式兜底: "N 小时 M 分钟 K 秒" 或 "N小时M分K秒" 或 "N天M小时"
+    # parse_time 已经支持中文时/分/秒, 这里直接调用整个 text
+    seconds = parse_time(text)
+    if seconds is not None and seconds <= 7 * 24 * 3600:
+        return seconds
 
     return None
 
@@ -807,7 +814,10 @@ async def check_login(page):
 
 async def find_add_time_button(page):
 
+    # 支持中英文按钮文本:
+    # 英文: "Add Time"  /  中文: "添加时间"
     candidates = [
+        # 英文 - role=button name 精确匹配
         page.get_by_role(
             "button",
             name=re.compile(
@@ -816,6 +826,15 @@ async def find_add_time_button(page):
             ),
         ),
 
+        # 中文 - role=button name 精确匹配
+        page.get_by_role(
+            "button",
+            name=re.compile(
+                r"^\s*添加\s*时间\s*$",
+            ),
+        ),
+
+        # 英文 - get_by_text 精确匹配
         page.get_by_text(
             re.compile(
                 r"^\s*Add\s+Time\s*$",
@@ -823,12 +842,38 @@ async def find_add_time_button(page):
             ),
         ),
 
+        # 中文 - get_by_text 精确匹配
+        page.get_by_text(
+            re.compile(
+                r"^\s*添加\s*时间\s*$",
+            ),
+        ),
+
+        # 英文 - 任意 button 含 "Add Time"
         page.locator(
             "button"
         ).filter(
             has_text=re.compile(
                 r"Add\s*Time",
                 re.I,
+            )
+        ),
+
+        # 中文 - 任意 button 含 "添加时间"
+        page.locator(
+            "button"
+        ).filter(
+            has_text=re.compile(
+                r"添加\s*时间",
+            )
+        ),
+
+        # 兜底 - 任意元素 (含 button/a/div) 含 "添加时间"
+        page.locator(
+            ":has-text('添加时间')"
+        ).filter(
+            has_text=re.compile(
+                r"添加\s*时间",
             )
         ),
     ]
