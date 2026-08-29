@@ -63,7 +63,7 @@ jobs:
       - name: Validate required secrets
         env:
           FALIX_SERVER_IDS: ${{ secrets.FALIX_SERVER_IDS }}
-          FALIX_STORAGE_STATE_B64: ${{ secrets.FALIX_STORAGE_STATE_B64 }}
+          FALIX_STORAGE_STATE: ${{ secrets.FALIX_STORAGE_STATE }}
         shell: bash
         run: |
           set -e
@@ -73,24 +73,24 @@ jobs:
             exit 1
           fi
 
-          if [ -z "$FALIX_STORAGE_STATE_B64" ]; then
-            echo "::error::FALIX_STORAGE_STATE_B64 is missing"
+          if [ -z "$FALIX_STORAGE_STATE" ]; then
+            echo "::error::FALIX_STORAGE_STATE is missing"
             exit 1
           fi
 
           echo "FALIX_SERVER_IDS: configured"
-          echo "FALIX_STORAGE_STATE_B64: configured"
+          echo "FALIX_STORAGE_STATE: configured"
 
       - name: Restore Falix storage state
         env:
-          FALIX_STORAGE_STATE_B64: ${{ secrets.FALIX_STORAGE_STATE_B64 }}
+          FALIX_STORAGE_STATE: ${{ secrets.FALIX_STORAGE_STATE }}
         shell: bash
         run: |
           set -e
 
           rm -f falix_state.json
 
-          printf '%s' "$FALIX_STORAGE_STATE_B64" |
+          printf '%s' "$FALIX_STORAGE_STATE" |
             base64 --decode > falix_state.json
 
           if [ ! -s falix_state.json ]; then
