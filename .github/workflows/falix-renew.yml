@@ -59,6 +59,144 @@ jobs:
       - name: Install Playwright Chromium
         run: |
           python -m playwright install --with-deps chromium
+          # CloakBrowser 需要单独 ensure_binary (会自动下载 stealth Chromium)
+          python -c "from cloakbrowser import ensure_binary; ensure_binary()" || echo "cloakbrowser ensure_binary failed (may use system Chromium)"
+
+      - name: "🌐 启动代理 (sing-box, 多格式: hysteria2/hy2/tuic/vless/vmess)"
+        env:
+          PROXY_URI: ${{ secrets.PROXY_URI }}
+        shell: bash
+        run: |
+          set -e
+
+          # PROXY_URI 是可选的; 不配代理则直连 (GitHub IP 可能被 CF 风控,
+          # managed challenge 大概率无法自动通过, 但仍可尝试)
+          if [ -z "$PROXY_URI" ]; then
+            echo "⚠️  PROXY_URI 未配置, 直连模式 (CF managed challenge 可能无法通过)"
+            echo "建议: 配 PROXY_URI secret (住宅代理最佳), 格式与 zampto 项目一致:"
+            echo "  hysteria2://password@host:port?sni=...&insecure=1"
+            echo "  hy2://password@host:port?..."
+            echo "  tuic://uuid:password@host:port?..."
+            echo "  vless://uuid@host:port?..."
+            echo "  vmess://base64..."
+            exit 0
+          fi
+
+          echo "[1/4] 解析节点链接并生成 sing-box 配置 ..."
+          python3 << 'PYEOF'
+          import urllib.parse, json, os, sys, base64
+
+          link = os.environ.get("PROXY_URI", "").strip()
+          if not link:
+              sys.exit(1)
+
+          proto = "hysteria2"
+          for prefix in ["hysteria2://", "hy2://", "tuic://", "vless://", "vmess://"]:
+              if link.startswith(prefix):
+                  link = link[len(prefix):]
+                  proto = {"tuic://": "tuic", "vless://": "vless", "vmess://": "vmess"}.get(prefix, "hysteria2")
+                  break
+          link = link.split("#", 1)[0]
+          if "?" in link:
+              main, query = link.split("?", 1)
+          else:
+              main, query = link, ""
+          params = urllib.parse.parse_qs(query)
+          sni = params.get("sni", [""])[0]
+          insecure = any(params.get(k, ["0"])[0] in ("1", "true", "yes")
+                         for k in ("insecure", "allowInsecure", "allow_insecure"))
+          alpn = params.get("alpn", [""])[0]
+
+          out = {"type": proto, "tag": "proxy-out"}
+          if proto == "vmess":
+              b64 = main + "=" * ((4 - len(main) % 4) % 4)
+              vm = json.loads(base64.b64decode(b64).decode("utf-8", "ignore"))
+              out["server"] = vm.get("add", "")
+              out["server_port"] = int(vm.get("port", 0))
+              out["uuid"] = vm.get("id", "")
+              out["alter_id"] = int(vm.get("aid", "0"))
+              out["security"] = vm.get("scy", "auto") or "auto"
+              out["tls"] = {"enabled": False, "server_name": sni or vm.get("host", ""), "insecure": insecure}
+              if vm.get("tls") == "tls" or vm.get("sni") or vm.get("host"):
+                  out["tls"]["enabled"] = True
+                  out["tls"]["server_name"] = sni or vm.get("sni") or vm.get("host") or out["server"]
+          else:
+              password_raw, server_part = main.rsplit("@", 1)
+              password = urllib.parse.unquote(password_raw)
+              server, port_str = server_part.rsplit(":", 1)
+              out["server"] = server
+              out["server_port"] = int(port_str)
+              if proto == "tuic" or proto == "vless":
+                  if ":" in password:
+                      out["uuid"], out["password"] = password.split(":", 1)
+                  else:
+                      out["uuid"] = password
+              else:
+                  out["password"] = password
+              out["tls"] = {"enabled": True, "server_name": sni or server, "insecure": insecure}
+              if alpn:
+                  out["tls"]["alpn"] = [alpn]
+              if proto == "tuic":
+                  out["udp_relay_mode"] = "native"
+                  out["congestion_control"] = "bbr"
+              elif proto == "hysteria2":
+                  out["up_mbps"] = 100
+                  out["down_mbps"] = 100
+
+          cfg = {
+              "log": {"level": "info", "timestamp": True},
+              "inbounds": [{"type": "socks", "tag": "socks-in",
+                            "listen": "127.0.0.1", "listen_port": 1080}],
+              "outbounds": [out],
+          }
+          with open("/tmp/sb_config.json", "w", encoding="utf-8") as f:
+              json.dump(cfg, f, indent=2, ensure_ascii=False)
+          print("Protocol:", proto)
+          print("Server:", out.get("server", "?"), ":", out.get("server_port", "?"))
+          print("SNI:", out.get("tls", {}).get("server_name", ""))
+          print("Insecure:", insecure)
+          PYEOF
+          echo "--- 生成的配置 ---"
+          cat /tmp/sb_config.json
+
+          echo "[2/4] Downloading sing-box ..."
+          SB_VERSION="1.10.7"
+          SB_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz"
+          curl -fSL "$SB_URL" -o /tmp/sb.tar.gz
+          tar -xzf /tmp/sb.tar.gz -C /tmp/
+          mv /tmp/sing-box-${SB_VERSION}-linux-amd64/sing-box /tmp/sing-box
+          chmod +x /tmp/sing-box
+
+          # Validate config before running
+          echo "--- Validating config ---"
+          /tmp/sing-box check -c /tmp/sb_config.json || { echo "[ERROR] sing-box config validation failed"; cat /tmp/sb_config.json; exit 1; }
+
+          echo "[3/4] Starting sing-box ..."
+          nohup /tmp/sing-box run -c /tmp/sb_config.json > /tmp/sb.log 2>&1 &
+          SB_PID=$!
+          echo "SB_PID=$SB_PID"
+          sleep 8
+
+          echo "--- sing-box log ---"
+          cat /tmp/sb.log || true
+          echo "--------------------"
+
+          echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
+          echo "Proxy IP:  $(curl -s --max-time 15 --socks5 127.0.0.1:1080 ifconfig.me || echo 'proxy fail')"
+
+          # 代理必须可用, 否则后续 CF 必拒
+          if curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://www.google.com -o /dev/null; then
+            echo "ALL_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
+            echo "HTTP_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
+            echo "HTTPS_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
+            echo "[OK] Proxy is ready"
+          else
+            echo "[ERROR] Proxy is DOWN"
+            echo "---- sing-box log ----"
+            cat /tmp/sb.log 2>/dev/null | tail -30 || echo "no log"
+            echo "----------------------"
+            exit 1
+          fi
 
       - name: Validate required secrets
         env:
@@ -208,9 +346,19 @@ jobs:
           echo "=========================================="
           echo "Run number: ${{ github.run_number }}"
           echo "Renew threshold: ${RENEW_BELOW_MINUTES:-20} minutes"
+          echo "Proxy: ${ALL_PROXY:-direct}"
           echo "Starting renew.py..."
 
           python renew.py
+          PYTHON_EXIT=$?
+
+          # CRITICAL: Clear proxy env vars so subsequent Node.js steps (upload-artifact)
+          # don't try to use SOCKS5 which they don't support
+          echo "ALL_PROXY=" >> $GITHUB_ENV
+          echo "HTTP_PROXY=" >> $GITHUB_ENV
+          echo "HTTPS_PROXY=" >> $GITHUB_ENV
+
+          exit $PYTHON_EXIT
 
       - name: Generate job summary
         if: always()
@@ -248,6 +396,15 @@ jobs:
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
+        env:
+          # 显式清空代理环境变量给 upload-artifact@v4 用 (Node undici 解析代理 URL,
+          # socks5h:// 它不支持会抛 "Invalid URL protocol" 错误).
+          # GitHub Actions env key 不区分大小写, 不能同时写 ALL_PROXY 和 all_proxy,
+          # 否则会被拒 "X is already defined". 这里只保留大写形式.
+          ALL_PROXY: ''
+          HTTP_PROXY: ''
+          HTTPS_PROXY: ''
+          NO_PROXY: '*'
         with:
           name: falix-debug-${{ github.run_number }}
           path: debug_output/

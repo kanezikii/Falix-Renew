@@ -7,13 +7,14 @@ Falix Renew Pro v2
 当前 Falix Timer 自动检查/续期程序。
 
 功能：
-- Playwright Chromium
+- CloakBrowser (stealth Chromium, 绕过 Cloudflare managed challenge 指纹检测)
 - Falix /timer?id=SERVER_ID
 - 自动读取 Timer
 - 低于阈值才尝试 Add Time
 - 多服务器
 - storage_state 登录
-- CAPTCHA / Turnstile 检测
+- CAPTCHA / Turnstile / Managed Challenge 自动通过 (坐标点击 iframe + 等待)
+- 代理支持 (socks5h:// + cloakbrowser)
 - Telegram 通知
 - Screenshot + HTML 调试
 - GitHub Actions 兼容
@@ -33,6 +34,10 @@ RENEW_BELOW_MINUTES
 HEADLESS
     true / false
 
+PROXY_URI
+    代理节点链接 (hysteria2/hy2/tuic/vless/vmess), 由 workflow 启动 sing-box
+    转成本地 socks5://127.0.0.1:1080. 不配则直连.
+
 TG_BOT_TOKEN
 TG_CHAT_ID
 """
@@ -46,8 +51,17 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
+
+# CloakBrowser 是 stealth Chromium, 绕过 CF 指纹检测; 接口与 Playwright Browser 兼容
+# 优先用 cloakbrowser, 不可用时降级到 playwright (开发环境/调试)
+try:
+    from cloakbrowser import launch as cloakbrowser_launch
+    HAS_CLOAKBROWSER = True
+except ImportError:
+    HAS_CLOAKBROWSER = False
+    from playwright.async_api import async_playwright
+
 from playwright.async_api import (
-    async_playwright,
     TimeoutError as PlaywrightTimeoutError,
 )
 
@@ -99,6 +113,16 @@ HEADLESS = (
     == "true"
 )
 
+# 代理: workflow 用 sing-box 启动 socks5 监听 127.0.0.1:1080, 通过 PROXY_URI 协议
+# 脚本只看 ALL_PROXY/HTTPS_PROXY env (workflow 设置 socks5h://127.0.0.1:1080)
+PROXY_URI = os.getenv("PROXY_URI", "").strip()
+USE_PROXY = bool(
+    os.getenv("ALL_PROXY")
+    or os.getenv("HTTPS_PROXY")
+    or os.getenv("HTTP_PROXY")
+    or PROXY_URI
+)
+
 TG_BOT_TOKEN = os.getenv(
     "TG_BOT_TOKEN",
     "",
@@ -108,6 +132,7 @@ TG_CHAT_ID = os.getenv(
     "TG_CHAT_ID",
     "",
 ).strip()
+
 
 
 # ============================================================
@@ -526,64 +551,78 @@ async def find_turnstile_iframe_box(page):
     return None, None
 
 
-async def solve_captcha(page, max_wait=90, click_after=8):
-    """等待 CAPTCHA / Turnstile 自动通过; 失败则用坐标点击 iframe 复选框.
+async def solve_captcha(page, max_wait=120, click_after=8):
+    """等待 CAPTCHA / Turnstile / Managed Challenge 自动通过; 失败则坐标点击.
 
     行为:
-      1. 检测到 Turnstile iframe 后, 优先等待自动通过
+      1. 检测到 CF challenge iframe 后, 优先等待自动通过
+         (managed challenge 多数情况会自动评估, 不需要交互)
       2. iframe 持续存在超过 click_after 秒未消失, 用 page.mouse.click 坐标点击
          iframe 内复选框位置 (左上区域)
       3. 点击前做随机鼠标移动 + 短停顿 (拟人化, 避免 CF 检测)
       4. 第一次点击后等 15s, 不通过再点击不同 offset
-      5. 整个流程上限 max_wait 秒
+      5. 整个流程上限 max_wait 秒 (managed challenge 默认 120s)
 
     跨域 iframe JS 不能 click 内部元素, 但 page.mouse.click 是浏览器层面的
     合成事件, 直接发 (x, y), 不受同源策略限制, 可"穿透" iframe.
 
+    Managed Challenge 检测: page.url 含 challenges.cloudflare.com 或
+    "Just a moment" / "Performing security verification" 等关键词
+
     返回 True 表示验证已通过, False 表示超时仍未通过.
     """
     import random as _rand
-    log("🛡️ 等待 CAPTCHA/Turnstile 自动通过 "
+    log("🛡️ 等待 CAPTCHA/Turnstile/Managed Challenge 自动通过 "
         f"(最长 {max_wait}s, {click_after}s 后尝试坐标点击)...")
     end_time = time.time() + max_wait
     iframe_first_seen = None
     last_click_at = None
     click_count = 0
-    iframe_ready_logged = False
+    last_diag_dump = 0
 
     while time.time() < end_time:
         try:
-            # 1. 检查是否还有 Turnstile 痕迹
+            # 1. 检查是否还在 CF challenge 页 (URL 含 /cdn-cgi/ 或 challenges.cloudflare.com)
+            current_url = (page.url or "").lower()
+            on_challenge_url = (
+                "challenges.cloudflare.com" in current_url
+                or "/cdn-cgi/" in current_url
+            )
+
+            # 2. 检查 iframe
             has_frame = False
             try:
                 for fr in page.frames:
                     furl = (fr.url or "").lower()
                     if ("challenges.cloudflare.com" in furl
                             or "turnstile" in furl
-                            or "captcha" in furl):
+                            or "captcha" in furl
+                            or "/cdn-cgi/" in furl):
                         has_frame = True
                         break
             except Exception:
                 pass
 
-            # 2. 用 detect_captcha 复用判断 (text + selector)
+            # 3. 用 detect_captcha 复用判断 (text + selector)
             has_captcha = await detect_captcha(page)
 
-            # 3. 验证已消失 -> 通过
-            if not has_captcha and not has_frame:
+            # 4. 全部消失 -> 通过
+            if not has_captcha and not has_frame and not on_challenge_url:
                 if iframe_first_seen:
                     elapsed = time.time() - iframe_first_seen
-                    log(f"  ✅ CAPTCHA/Turnstile 已通过 (耗时 {elapsed:.1f}s)")
+                    log(f"  ✅ CAPTCHA/Challenge 已通过 (耗时 {elapsed:.1f}s)")
                 else:
                     log("  ✅ 未出现 CAPTCHA, 无需验证")
                 return True
 
-            # 4. 记录 iframe 首次出现时间
-            if has_frame and iframe_first_seen is None:
+            # 5. 记录首次出现时间
+            if (has_frame or has_captcha or on_challenge_url) and iframe_first_seen is None:
                 iframe_first_seen = time.time()
-                log("  📍 CAPTCHA iframe 首次出现")
+                log("  📍 CAPTCHA/Challenge 首次出现")
+                if on_challenge_url:
+                    log(f"  (页面 URL 含 challenges.cloudflare.com, 这是 CF Managed Challenge)")
 
-            # 5. 等待超过 click_after 秒仍未通过 -> 坐标点击
+            # 6. 等待超过 click_after 秒仍未通过 -> 坐标点击
             if (has_frame and iframe_first_seen is not None
                     and time.time() - iframe_first_seen >= click_after):
                 iframe_el, box = await find_turnstile_iframe_box(page)
@@ -619,6 +658,13 @@ async def solve_captcha(page, max_wait=90, click_after=8):
                     if click_count == 1:
                         await asyncio.sleep(15)
                         continue
+                else:
+                    # 找不到 iframe box (可能是纯 managed challenge 无 visible widget)
+                    # 只能继续等, 限流诊断避免日志爆炸
+                    if time.time() - last_diag_dump > 15:
+                        log("  ⏳ 找不到 visible iframe box (可能是 Managed Challenge "
+                            "无 visible checkbox), 继续等待自动通过...")
+                        last_diag_dump = time.time()
 
             await asyncio.sleep(3)
         except Exception as e:
@@ -894,17 +940,17 @@ async def process_server(
         await save_debug(page, server_id, "captcha_before")
 
         # 尝试自动通过 CAPTCHA (先等自动通过, 失败则坐标点击 iframe)
-        captcha_ok = await solve_captcha(page, max_wait=90, click_after=8)
+        captcha_ok = await solve_captcha(page, max_wait=120, click_after=8)
 
         if not captcha_ok:
-            log("❌ CAPTCHA 自动通过失败 (90s 内未通过)")
+            log("❌ CAPTCHA 自动通过失败 (120s 内未通过)")
 
             await save_debug(page, server_id, "captcha_failed")
 
             send_tg(
                 "⚠️ Falix CAPTCHA 自动通过失败\n"
                 f"Server ID: {server_id}\n"
-                "已尝试坐标点击 iframe checkbox (90s), 仍无法通过."
+                "已尝试坐标点击 iframe checkbox (120s), 仍无法通过."
             )
 
             return False
@@ -997,17 +1043,17 @@ async def process_server(
 
         await save_debug(page, server_id, "captcha_after_click_before")
 
-        captcha_ok = await solve_captcha(page, max_wait=90, click_after=8)
+        captcha_ok = await solve_captcha(page, max_wait=120, click_after=8)
 
         if not captcha_ok:
-            log("❌ 点击后 CAPTCHA 自动通过失败 (90s 内未通过)")
+            log("❌ 点击后 CAPTCHA 自动通过失败 (120s 内未通过)")
 
             await save_debug(page, server_id, "captcha_after_click_failed")
 
             send_tg(
                 "⚠️ Falix 点击 Add Time 后 CAPTCHA 自动通过失败\n"
                 f"Server ID: {server_id}\n"
-                "已尝试坐标点击 iframe checkbox (90s), 仍无法通过."
+                "已尝试坐标点击 iframe checkbox (120s), 仍无法通过."
             )
 
             return False
@@ -1126,17 +1172,29 @@ async def main():
             "请先运行 generate_storage.py"
         )
 
-        sys.exit(1)
+        os._exit(1)
 
-    async with async_playwright() as playwright:
+    # 选择浏览器引擎: 优先 cloakbrowser (stealth, 绕 CF 指纹), 否则降级 playwright
+    log(f"🔍 Browser engine: {'cloakbrowser (stealth)' if HAS_CLOAKBROWSER else 'playwright (raw)'}")
+    log(f"🔍 Proxy: {'enabled (socks5h://127.0.0.1:1080)' if USE_PROXY else 'disabled (direct)'}")
 
-        browser = await playwright.chromium.launch(
+    if HAS_CLOAKBROWSER:
+        # CloakBrowser: 专用 stealth Chromium, 通过 launch() 拿 Playwright Browser 对象
+        # 接口与 playwright 完全兼容, 但已注入 stealth patches
+        proxy_arg = None
+        if USE_PROXY:
+            # socks5h = socks5 with hostname resolution on proxy side (避免 DNS 泄露)
+            proxy_arg = {"server": "socks5://127.0.0.1:1080"}
+
+        browser = await cloakbrowser_launch(
             headless=HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
+            proxy=proxy_arg,
+            # geoip=True 让 cloakbrowser 根据 IP 自动设置时区/locale/语言,
+            # 模拟真实用户环境 (CF managed challenge 会检查这些)
+            geoip=True,
+            # humanize=True 让 cloakbrowser 注入人类化鼠标移动轨迹,
+            # 进一步降低被识别为自动化的概率
+            humanize=True,
         )
 
         context = await browser.new_context(
@@ -1145,8 +1203,6 @@ async def main():
                 "width": 1440,
                 "height": 1000,
             },
-            locale="en-US",
-            timezone_id="Asia/Tokyo",
         )
 
         page = await context.new_page()
@@ -1196,6 +1252,84 @@ async def main():
         await context.close()
 
         await browser.close()
+
+    else:
+        # Fallback: 纯 playwright (开发/调试用, 必被 CF 拒)
+        log("⚠️ cloakbrowser 不可用, 降级到 playwright (CF managed challenge 可能无法通过)")
+
+        async with async_playwright() as playwright:
+
+            proxy_arg = None
+            if USE_PROXY:
+                proxy_arg = {"server": "socks5://127.0.0.1:1080"}
+
+            browser = await playwright.chromium.launch(
+                headless=HEADLESS,
+                proxy=proxy_arg,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
+            )
+
+            context = await browser.new_context(
+                storage_state=STORAGE_STATE,
+                viewport={
+                    "width": 1440,
+                    "height": 1000,
+                },
+                locale="en-US",
+                timezone_id="Asia/Tokyo",
+            )
+
+            page = await context.new_page()
+
+            page.set_default_timeout(
+                15000
+            )
+
+            results = []
+
+            for server_id in SERVER_IDS:
+
+                try:
+                    result = (
+                        await process_server(
+                            page,
+                            server_id,
+                        )
+                    )
+
+                except Exception as e:
+                    log(
+                        f"❌ 未处理异常: {e}"
+                    )
+
+                    await save_debug(
+                        page,
+                        server_id,
+                        "exception",
+                    )
+
+                    send_tg(
+                        "💥 Falix 脚本异常\n"
+                        f"Server ID: {server_id}\n"
+                        f"Error: {e}"
+                    )
+
+                    result = False
+
+                results.append(
+                    (
+                        server_id,
+                        result,
+                    )
+                )
+
+            await context.close()
+
+            await browser.close()
 
     log("")
     log("=" * 70)
