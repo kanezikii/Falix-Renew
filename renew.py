@@ -54,8 +54,11 @@ import requests
 
 # CloakBrowser 是 stealth Chromium, 绕过 CF 指纹检测; 接口与 Playwright Browser 兼容
 # 优先用 cloakbrowser, 不可用时降级到 playwright (开发环境/调试)
+# 重要: cloakbrowser.launch() 是 SYNC API, 不能在 asyncio 里 await (会抛
+# "It looks like you are using Playwright Sync API inside the asyncio loop").
+# 必须用 launch_context_async() (async 版本), 返回 BrowserContext (async API).
 try:
-    from cloakbrowser import launch as cloakbrowser_launch
+    from cloakbrowser import launch_context_async as cloakbrowser_launch_async
     HAS_CLOAKBROWSER = True
 except ImportError:
     HAS_CLOAKBROWSER = False
@@ -1137,20 +1140,19 @@ async def main():
     )
 
     log(
-        "Falix Renew Pro v2"
+        "Falix Renew Pro v2 (Falix 自动续期)"
     )
 
     log(
-        f"Servers: {len(SERVER_IDS)}"
+        f"服务器数量: {len(SERVER_IDS)}"
     )
 
     log(
-        "Threshold: "
-        f"{RENEW_BELOW_MINUTES} minutes"
+        f"续期阈值: {RENEW_BELOW_MINUTES} 分钟"
     )
 
     log(
-        f"Headless: {HEADLESS}"
+        f"无头模式: {HEADLESS}"
     )
 
     log(
@@ -1179,14 +1181,20 @@ async def main():
     log(f"🔍 Proxy: {'enabled (socks5h://127.0.0.1:1080)' if USE_PROXY else 'disabled (direct)'}")
 
     if HAS_CLOAKBROWSER:
-        # CloakBrowser: 专用 stealth Chromium, 通过 launch() 拿 Playwright Browser 对象
-        # 接口与 playwright 完全兼容, 但已注入 stealth patches
+        # CloakBrowser: 专用 stealth Chromium, 用 launch_context_async (async API)
+        # launch_context_async 直接返回 BrowserContext (async), 不需要先 launch 再 new_context
+        # 它内部启动 stealth Chromium, 已注入绕过 CF 指纹检测的 patches:
+        #   * 真实 Chromium 二进制 (非 playwright 自带的)
+        #   * UA / navigator.webdriver / canvas / WebGL 指纹修改
+        #   * 屏蔽 CDP (Chrome DevTools Protocol) 痕迹
         proxy_arg = None
         if USE_PROXY:
-            # socks5h = socks5 with hostname resolution on proxy side (避免 DNS 泄露)
-            proxy_arg = {"server": "socks5://127.0.0.1:1080"}
+            # socks5 = socks5 with hostname resolution on proxy side (避免 DNS 泄露)
+            # 注意: cloakbrowser 接受字符串 URL 或 Playwright proxy dict
+            proxy_arg = "socks5://127.0.0.1:1080"
 
-        browser = await cloakbrowser_launch(
+        # launch_context_async 接受所有 new_context() 的 kwargs (storage_state, viewport, ...)
+        context = await cloakbrowser_launch_async(
             headless=HEADLESS,
             proxy=proxy_arg,
             # geoip=True 让 cloakbrowser 根据 IP 自动设置时区/locale/语言,
@@ -1195,9 +1203,7 @@ async def main():
             # humanize=True 让 cloakbrowser 注入人类化鼠标移动轨迹,
             # 进一步降低被识别为自动化的概率
             humanize=True,
-        )
-
-        context = await browser.new_context(
+            # 以下 kwargs 透传给 browser.new_context()
             storage_state=STORAGE_STATE,
             viewport={
                 "width": 1440,
@@ -1249,9 +1255,8 @@ async def main():
                 )
             )
 
+        # launch_context_async 返回的 context 关闭时会自动关闭 underlying browser
         await context.close()
-
-        await browser.close()
 
     else:
         # Fallback: 纯 playwright (开发/调试用, 必被 CF 拒)
