@@ -2,7 +2,7 @@
 
 > 自动检测并续期 **Falix** 免费服务器的工具（通过 Falix `/timer` 接口完成续期）。
 >
-> 项目仓库：[weikkadd/Falix-Renew-Pro-v2](https://github.com/weikkadd/Falix-Renew-Pro-v2)
+> 网站：(https://client.falixnodes.net/)
 
 ---
 
