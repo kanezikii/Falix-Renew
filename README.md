@@ -99,7 +99,7 @@ base64 -w 0 falix_state.json
 | Secret 名称 | 必填 | 说明 | 示例 |
 |---|---|---|---|
 | `FALIX_SERVER_IDS` | ✅ | 服务器 ID，多个用**英文逗号**分隔 | `123456,789012` |
-| `FALIX_STORAGE_STATE_B64` | ✅ | 登录会话 JSON 的 **Base64 编码** | `eyJjb29raWVzIjpbXX0=`（很长） |
+| `FALIX_STORAGE_STATE | ✅ | 登录会话 JSON 的 **Base64 编码**  {base64 编码后的 session.json 内容} 
 | `TG_BOT_TOKEN` | ⭕ | Telegram Bot Token（用于通知） | `123456:ABC-xxx` |
 | `TG_CHAT_ID` | ⭕ | 接收通知的 Telegram 聊天/群组 ID | `-100123456789` |
 
