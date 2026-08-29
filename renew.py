@@ -655,11 +655,15 @@ async def solve_captcha(page, max_wait=120, click_after=8):
             except Exception:
                 pass
 
-            # 3. 用 detect_captcha 复用判断 (text + selector)
+            # 3. 用 detect_captcha 复用判断 (已优先检查 cf-turnstile-response value)
             has_captcha = await detect_captcha(page)
 
             # 4. 全部消失 -> 通过
-            if not has_captcha and not has_frame and not on_challenge_url:
+            # 注意: Turnstile widget 通过后 iframe 仍会留在 DOM 里 (只是变绿色对勾),
+            # 所以不能只看 has_frame / on_challenge_url. detect_captcha 现在会检查
+            # cf-turnstile-response 是否有 value, 有 value 即返回 False (已通过).
+            # 因此只要 has_captcha=False 就算通过.
+            if not has_captcha:
                 if iframe_first_seen:
                     elapsed = time.time() - iframe_first_seen
                     log(f"  ✅ CAPTCHA/Challenge 已通过 (耗时 {elapsed:.1f}s)")
@@ -673,6 +677,36 @@ async def solve_captcha(page, max_wait=120, click_after=8):
                 log("  📍 CAPTCHA/Challenge 首次出现")
                 if on_challenge_url:
                     log(f"  (页面 URL 含 challenges.cloudflare.com, 这是 CF Managed Challenge)")
+
+            # 5.5 诊断: 每隔 ~15s 检查 turnstile-response value (帮判断 widget 通过时机)
+            if iframe_first_seen and (time.time() - last_diag_dump) > 15:
+                try:
+                    response_info = await page.evaluate("""
+                    (() => {
+                        const inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+                        const results = [];
+                        for (const inp of inputs) {
+                            results.push({
+                                id: inp.id || '(no-id)',
+                                valueLen: (inp.value || '').length,
+                                valuePrefix: (inp.value || '').slice(0, 30),
+                            });
+                        }
+                        return JSON.stringify(results);
+                    })();
+""")
+                    import json as _ij
+                    responses = _ij.loads(response_info) if response_info else []
+                    if responses:
+                        for r in responses:
+                            if r.get("valueLen", 0) > 10:
+                                log(f"  🎫 cf-turnstile-response 已有 value (len={r['valueLen']} id={r['id']})")
+                                log(f"     value 前缀: {r['valuePrefix']}...")
+                            else:
+                                log(f"  ⏳ cf-turnstile-response 还没 value (id={r['id']} len={r['valueLen']})")
+                except Exception:
+                    pass
+                last_diag_dump = time.time()
 
             # 6. 等待超过 click_after 秒仍未通过 -> 坐标点击
             if (has_frame and iframe_first_seen is not None
