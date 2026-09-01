@@ -1,4 +1,4 @@
-# Falix Renew Pro v2
+# Falix Renew
 
 > 自动检测并续期 **Falix** 免费服务器的工具（通过 Falix `/timer` 接口完成续期）。
 >
