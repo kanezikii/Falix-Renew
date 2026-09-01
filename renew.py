@@ -607,6 +607,49 @@ async def find_turnstile_iframe_box(page):
     except Exception:
         pass
 
+    # 策略 D: 找 Turnstile 容器 div (cf-chl-widget / .cf-turnstile) 的 bounding box
+    # 某些情况下 iframe 在 DOM 里但 page.frames / query_selector 检测不到,
+    # 但 widget 容器 div 一定在 (hidden input id 形如 cf-chl-widget-xxx_response).
+    try:
+        js_widget_box = """
+        (() => {
+            const boxes = [];
+            const sels = [
+                'div[id*="cf-chl-widget"]', 'div.cf-turnstile',
+                'div[class*="cf-chl"]', '[id*="cf-chl-widget"]',
+            ];
+            for (const sel of sels) {
+                for (const el of document.querySelectorAll(sel)) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                        boxes.push({
+                            id: el.id || el.className || sel,
+                            x: Math.round(r.left), y: Math.round(r.top),
+                            w: Math.round(r.width), h: Math.round(r.height),
+                        });
+                    }
+                }
+            }
+            // 去重 (同一元素可能命中多个选择器)
+            const seen = new Set();
+            const uniq = [];
+            for (const b of boxes) {
+                const key = b.x + ',' + b.y + ',' + b.w + ',' + b.h;
+                if (!seen.has(key)) { seen.add(key); uniq.push(b); }
+            }
+            return JSON.stringify(uniq);
+        })();
+"""
+        result = await page.evaluate(js_widget_box)
+        import json as _ij
+        widget_list = _ij.loads(result) if result else []
+        if widget_list:
+            wb = widget_list[0]
+            return None, {"x": wb["x"], "y": wb["y"],
+                          "width": wb["w"], "height": wb["h"]}
+    except Exception:
+        pass
+
     return None, None
 
 
@@ -716,8 +759,11 @@ async def solve_captcha(page, max_wait=120, click_after=8):
                 last_diag_dump = time.time()
 
             # 6. 等待超过 click_after 秒仍未通过 -> 坐标点击
-            if (has_frame and iframe_first_seen is not None
-                    and time.time() - iframe_first_seen >= click_after):
+            #    触发条件: 检测到 CAPTCHA (widget/input 存在) 即可尝试, 不必依赖
+            #    iframe URL 检测 (有时 iframe 在 DOM 里但 page.frames 检测不到)
+            if (iframe_first_seen is not None
+                    and time.time() - iframe_first_seen >= click_after
+                    and (has_frame or has_captcha)):
                 iframe_el, box = await find_turnstile_iframe_box(page)
                 if box:
                     # 3 种 offset 循环: 最左上 / 标准 / 更左上
