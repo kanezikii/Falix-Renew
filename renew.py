@@ -1172,6 +1172,12 @@ async def process_server(
                 "✅ Timer 尚未低于阈值"
             )
 
+            send_tg(
+                "⏭️ Falix Timer 充足, 无需续期\n"
+                f"Server ID: {server_id}\n"
+                f"Timer: {format_seconds(before)}"
+            )
+
             return True
 
     # Add Time
@@ -1536,6 +1542,13 @@ async def main():
         f"成功: {success}/"
         f"{len(results)}"
     )
+
+    # 汇总 TG 通知 (每个服务器状态)
+    summary_lines = ["🎮 Falix 自动续期", f"✅ 成功: {success}/{len(results)}"]
+    for server_id, result in results:
+        st = "✅ OK" if result else "❌ FAILED"
+        summary_lines.append(f"{st} {server_id}")
+    send_tg("\n".join(summary_lines))
 
     if success != len(results):
         # 用 os._exit 替代 sys.exit: 避免 Playwright event loop 在退出时
