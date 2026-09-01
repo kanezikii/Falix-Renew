@@ -106,6 +106,46 @@ jobs:
           insecure = any(params.get(k, ["0"])[0] in ("1", "true", "yes")
                          for k in ("insecure", "allowInsecure", "allow_insecure"))
           alpn = params.get("alpn", [""])[0]
+          # 传输/流控/安全参数 (原生成器缺失: ws/grpc/reality/flow 节点会连不上)
+          net_type = (params.get("type") or params.get("network") or [""])[0].lower()
+          ws_path = params.get("path", [""])[0]
+          ws_host = params.get("host", [""])[0]
+          flow = params.get("flow", [""])[0]
+          security = params.get("security", [""])[0].lower()
+          pbk = params.get("pbk", [""])[0]
+          sid = params.get("sid", [""])[0]
+          fp = params.get("fp", [""])[0]
+          svc_name = params.get("serviceName", [""])[0]
+
+          def add_transport(o, default_ws_path="/"):
+              """按 URL 参数加传输层 (ws / grpc)"""
+              if net_type in ("ws", "websocket"):
+                  o["transport"] = {
+                      "type": "ws",
+                      "path": ws_path or default_ws_path,
+                      "headers": {"Host": ws_host} if ws_host else {},
+                  }
+              elif net_type == "grpc":
+                  o["transport"] = {"type": "grpc", "service_name": svc_name or ""}
+
+          def add_tls(o, default_sni):
+              """按 security 参数配 TLS / REALITY"""
+              sec = security or ("reality" if pbk else "tls")
+              if sec == "none":
+                  o["tls"] = {"enabled": False}
+                  return
+              tls = {"enabled": True, "server_name": sni or default_sni, "insecure": insecure}
+              if alpn:
+                  tls["alpn"] = [alpn]
+              if sec == "reality":
+                  tls["reality"] = {"enabled": True}
+                  if pbk:
+                      tls["reality"]["public_key"] = pbk
+                  if sid:
+                      tls["reality"]["short_id"] = sid
+                  if fp:
+                      tls["fingerprint"] = fp
+              o["tls"] = tls
 
           out = {"type": proto, "tag": "proxy-out"}
           if proto == "vmess":
@@ -116,10 +156,22 @@ jobs:
               out["uuid"] = vm.get("id", "")
               out["alter_id"] = int(vm.get("aid", "0"))
               out["security"] = vm.get("scy", "auto") or "auto"
-              out["tls"] = {"enabled": False, "server_name": sni or vm.get("host", ""), "insecure": insecure}
-              if vm.get("tls") == "tls" or vm.get("sni") or vm.get("host"):
-                  out["tls"]["enabled"] = True
-                  out["tls"]["server_name"] = sni or vm.get("sni") or vm.get("host") or out["server"]
+              if vm.get("tls") == "tls" or vm.get("sni") or vm.get("host") or security == "tls":
+                  add_tls(out, vm.get("sni") or vm.get("host") or out["server"])
+              else:
+                  out["tls"] = {"enabled": False, "insecure": insecure}
+              # vmess 的传输/路径/host 通常在 base64 内部 (net/path/host), 与 URL 参数兼容
+              v_net = (net_type or (vm.get("net") or "")).lower()
+              if v_net in ("ws", "websocket"):
+                  out["transport"] = {
+                      "type": "ws",
+                      "path": ws_path or vm.get("path", "/"),
+                      "headers": {"Host": ws_host or vm.get("host", "")},
+                  }
+              elif v_net == "grpc":
+                  out["transport"] = {"type": "grpc", "service_name": svc_name or vm.get("serviceName", "")}
+              elif v_net not in ("", "tcp", "none"):
+                  add_transport(out, vm.get("path", "/"))
           else:
               password_raw, server_part = main.rsplit("@", 1)
               password = urllib.parse.unquote(password_raw)
@@ -133,15 +185,16 @@ jobs:
                       out["uuid"] = password
               else:
                   out["password"] = password
-              out["tls"] = {"enabled": True, "server_name": sni or server, "insecure": insecure}
-              if alpn:
-                  out["tls"]["alpn"] = [alpn]
+              add_tls(out, server)
+              if flow and proto == "vless":
+                  out["flow"] = flow
               if proto == "tuic":
                   out["udp_relay_mode"] = "native"
                   out["congestion_control"] = "bbr"
               elif proto == "hysteria2":
                   out["up_mbps"] = 100
                   out["down_mbps"] = 100
+              add_transport(out)
 
           cfg = {
               "log": {"level": "info", "timestamp": True},
