@@ -1,4 +1,4 @@
-﻿name: Falix Renew Pro
+name: Falix Renew Pro
 
 on:
   workflow_dispatch:
@@ -59,26 +59,16 @@ jobs:
       - name: 📦 安装 Playwright Chromium + CloakBrowser stealth Chromium
         run: |
           python -m playwright install --with-deps chromium
-          # CloakBrowser 需要单独 ensure_binary (会自动下载 stealth Chromium)
-          python -c "from cloakbrowser import ensure_binary; ensure_binary()" || echo "cloakbrowser ensure_binary 失败 (可能用系统 Chromium 兜底)"
+          python -c "from cloakbrowser import ensure_binary; ensure_binary()" || echo "cloakbrowser ensure_binary 降级"
 
-      - name: "🌐 启动代理 (sing-box, 多格式: hysteria2/hy2/tuic/vless/vmess)"
+      - name: "🌐 启动代理 (sing-box)"
         env:
           PROXY_URI: ${{ secrets.PROXY_URI }}
         shell: bash
         run: |
           set -e
-
-          # PROXY_URI 是可选的; 不配代理则直连 (GitHub IP 可能被 CF 风控,
-          # managed challenge 大概率无法自动通过, 但仍可尝试)
           if [ -z "$PROXY_URI" ]; then
-            echo "⚠️  PROXY_URI 未配置, 直连模式 (CF managed challenge 可能无法通过)"
-            echo "建议: 配 PROXY_URI secret (住宅代理最佳), 格式与 zampto 项目一致:"
-            echo "  hysteria2://password@host:port?sni=...&insecure=1"
-            echo "  hy2://password@host:port?..."
-            echo "  tuic://uuid:password@host:port?..."
-            echo "  vless://uuid@host:port?..."
-            echo "  vmess://base64..."
+            echo "⚠️ PROXY_URI 未配置，直连运行"
             exit 0
           fi
 
@@ -97,16 +87,11 @@ jobs:
                   proto = {"tuic://": "tuic", "vless://": "vless", "vmess://": "vmess"}.get(prefix, "hysteria2")
                   break
           link = link.split("#", 1)[0]
-          if "?" in link:
-              main, query = link.split("?", 1)
-          else:
-              main, query = link, ""
+          main, query = link.split("?", 1) if "?" in link else (link, "")
           params = urllib.parse.parse_qs(query)
           sni = params.get("sni", [""])[0]
-          insecure = any(params.get(k, ["0"])[0] in ("1", "true", "yes")
-                         for k in ("insecure", "allowInsecure", "allow_insecure"))
+          insecure = any(params.get(k, ["0"])[0] in ("1", "true", "yes") for k in ("insecure", "allowInsecure", "allow_insecure"))
           alpn = params.get("alpn", [""])[0]
-          # 传输/流控/安全参数 (原生成器缺失: ws/grpc/reality/flow 节点会连不上)
           net_type = (params.get("type") or params.get("network") or [""])[0].lower()
           ws_path = params.get("path", [""])[0]
           ws_host = params.get("host", [""])[0]
@@ -118,18 +103,12 @@ jobs:
           svc_name = params.get("serviceName", [""])[0]
 
           def add_transport(o, default_ws_path="/"):
-              """按 URL 参数加传输层 (ws / grpc)"""
               if net_type in ("ws", "websocket"):
-                  o["transport"] = {
-                      "type": "ws",
-                      "path": ws_path or default_ws_path,
-                      "headers": {"Host": ws_host} if ws_host else {},
-                  }
+                  o["transport"] = {"type": "ws", "path": ws_path or default_ws_path, "headers": {"Host": ws_host} if ws_host else {}}
               elif net_type == "grpc":
                   o["transport"] = {"type": "grpc", "service_name": svc_name or ""}
 
           def add_tls(o, default_sni):
-              """按 security 参数配 TLS / REALITY"""
               sec = security or ("reality" if pbk else "tls")
               if sec == "none":
                   o["tls"] = {"enabled": False}
@@ -139,12 +118,9 @@ jobs:
                   tls["alpn"] = [alpn]
               if sec == "reality":
                   tls["reality"] = {"enabled": True}
-                  if pbk:
-                      tls["reality"]["public_key"] = pbk
-                  if sid:
-                      tls["reality"]["short_id"] = sid
-                  if fp:
-                      tls["fingerprint"] = fp
+                  if pbk: tls["reality"]["public_key"] = pbk
+                  if sid: tls["reality"]["short_id"] = sid
+                  if fp: tls["fingerprint"] = fp
               o["tls"] = tls
 
           out = {"type": proto, "tag": "proxy-out"}
@@ -160,14 +136,9 @@ jobs:
                   add_tls(out, vm.get("sni") or vm.get("host") or out["server"])
               else:
                   out["tls"] = {"enabled": False, "insecure": insecure}
-              # vmess 的传输/路径/host 通常在 base64 内部 (net/path/host), 与 URL 参数兼容
               v_net = (net_type or (vm.get("net") or "")).lower()
               if v_net in ("ws", "websocket"):
-                  out["transport"] = {
-                      "type": "ws",
-                      "path": ws_path or vm.get("path", "/"),
-                      "headers": {"Host": ws_host or vm.get("host", "")},
-                  }
+                  out["transport"] = {"type": "ws", "path": ws_path or vm.get("path", "/"), "headers": {"Host": ws_host or vm.get("host", "")}}
               elif v_net == "grpc":
                   out["transport"] = {"type": "grpc", "service_name": svc_name or vm.get("serviceName", "")}
               elif v_net not in ("", "tcp", "none"):
@@ -178,7 +149,7 @@ jobs:
               server, port_str = server_part.rsplit(":", 1)
               out["server"] = server
               out["server_port"] = int(port_str)
-              if proto == "tuic" or proto == "vless":
+              if proto in ("tuic", "vless"):
                   if ":" in password:
                       out["uuid"], out["password"] = password.split(":", 1)
                   else:
@@ -198,19 +169,12 @@ jobs:
 
           cfg = {
               "log": {"level": "info", "timestamp": True},
-              "inbounds": [{"type": "socks", "tag": "socks-in",
-                            "listen": "127.0.0.1", "listen_port": 1080}],
+              "inbounds": [{"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080}],
               "outbounds": [out],
           }
           with open("/tmp/sb_config.json", "w", encoding="utf-8") as f:
               json.dump(cfg, f, indent=2, ensure_ascii=False)
-          print("协议:", proto)
-          print("服务器:", out.get("server", "?"), ":", out.get("server_port", "?"))
-          print("SNI:", out.get("tls", {}).get("server_name", ""))
-          print("禁用证书校验:", insecure)
           PYEOF
-          echo "--- 生成的配置 ---"
-          cat /tmp/sb_config.json
 
           echo "[2/4] 下载 sing-box ..."
           SB_VERSION="1.10.7"
@@ -220,34 +184,19 @@ jobs:
           mv /tmp/sing-box-${SB_VERSION}-linux-amd64/sing-box /tmp/sing-box
           chmod +x /tmp/sing-box
 
-          # 启动前校验配置
-          echo "--- 校验 sing-box 配置 ---"
-          /tmp/sing-box check -c /tmp/sb_config.json || { echo "[错误] sing-box 配置校验失败"; cat /tmp/sb_config.json; exit 1; }
+          /tmp/sing-box check -c /tmp/sb_config.json
 
           echo "[3/4] 启动 sing-box ..."
           nohup /tmp/sing-box run -c /tmp/sb_config.json > /tmp/sb.log 2>&1 &
-          SB_PID=$!
-          echo "SB_PID=$SB_PID"
-          sleep 8
+          sleep 5
 
-          echo "--- sing-box 日志 ---"
-          cat /tmp/sb.log || true
-          echo "--------------------"
-
-          echo "直连 IP: $(curl -s --max-time 5 ifconfig.me || echo '失败')"
-          echo "代理 IP: $(curl -s --max-time 15 --socks5 127.0.0.1:1080 ifconfig.me || echo '代理失败')"
-
-          # 代理必须可用, 否则后续 CF 必拒
+          # 注意：仅设置专用的 FALIX_PROXY，严禁注入 ALL_PROXY / HTTP_PROXY 到全局 GITHUB_ENV
           if curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://www.google.com -o /dev/null; then
-            echo "ALL_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
-            echo "HTTP_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
-            echo "HTTPS_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
+            echo "FALIX_PROXY=socks5://127.0.0.1:1080" >> $GITHUB_ENV
             echo "[OK] 代理已就绪"
           else
-            echo "[错误] 代理不可用"
-            echo "---- sing-box 日志 ----"
-            cat /tmp/sb.log 2>/dev/null | tail -30 || echo "无日志"
-            echo "----------------------"
+            echo "[错误] 代理连接失败"
+            cat /tmp/sb.log 2>/dev/null || true
             exit 1
           fi
 
@@ -258,19 +207,9 @@ jobs:
         shell: bash
         run: |
           set -e
-
-          if [ -z "$FALIX_SERVER_IDS" ]; then
-            echo "::error::缺少 FALIX_SERVER_IDS"
-            exit 1
-          fi
-
-          if [ -z "$FALIX_STORAGE_STATE" ]; then
-            echo "::error::缺少 FALIX_STORAGE_STATE"
-            exit 1
-          fi
-
-          echo "FALIX_SERVER_IDS: 已配置"
-          echo "FALIX_STORAGE_STATE: 已配置"
+          [ -z "$FALIX_SERVER_IDS" ] && { echo "::error::缺少 FALIX_SERVER_IDS"; exit 1; }
+          [ -z "$FALIX_STORAGE_STATE" ] && { echo "::error::缺少 FALIX_STORAGE_STATE"; exit 1; }
+          echo "Secrets 校验通过"
 
       - name: 📥 还原 Falix 登录会话 (storage_state)
         env:
@@ -278,105 +217,60 @@ jobs:
         shell: bash
         run: |
           set -e
-
           rm -f falix_state.json
-
-          # 兼容两种 secret 内容:
-          # 1) base64 编码的 storage_state JSON (zampto 项目同款格式)
-          # 2) 直接的 storage_state JSON 明文 (Cookie Manager Pro 直接复制)
-          # 先尝试 base64 --decode; 若失败 (invalid input), 假定是明文 JSON.
           if printf '%s' "$FALIX_STORAGE_STATE" | base64 --decode > falix_state.json 2>/dev/null; then
-            # 解码成功, 校验是否合法 JSON
-            if python3 -c "import json,sys; json.load(open('falix_state.json'))" 2>/dev/null; then
-              echo "storage_state 还原成功 (base64 解码)"
-            else
-              echo "::error::base64 解码后不是合法 JSON"
-              exit 1
-            fi
+            python3 -c "import json; json.load(open('falix_state.json'))" 2>/dev/null || printf '%s' "$FALIX_STORAGE_STATE" > falix_state.json
           else
-            # base64 解码失败, 假定 secret 是明文 JSON, 直接写入
             printf '%s' "$FALIX_STORAGE_STATE" > falix_state.json
-            if python3 -c "import json,sys; json.load(open('falix_state.json'))" 2>/dev/null; then
-              echo "storage_state 还原成功 (明文 JSON)"
-            else
-              echo "::error::既不是 base64 也不是合法 JSON"
-              exit 1
-            fi
           fi
+          echo "storage_state 写入完成"
 
-          if [ ! -s falix_state.json ]; then
-            echo "::error::falix_state.json 为空"
-            exit 1
-          fi
-
-          echo "storage_state 已就绪"
-
-      - name: 🔍 校验 storage_state 格式并自动转换
+      - name: 🔍 强类型清洗与规范化 storage_state
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
           path = Path("falix_state.json")
-
           try:
-              data = json.loads(path.read_text(encoding="utf-8"))
-          except Exception as exc:
-              print(f"::error::storage_state JSON 无效: {exc}")
+              raw = json.loads(path.read_text(encoding="utf-8"))
+          except Exception as e:
+              print(f"::error::storage_state JSON 解析失败: {e}")
               raise SystemExit(1)
 
-          # 兼容两种格式:
-          # 1) Playwright storage_state: {"cookies": [...], "origins": [...]}
-          # 2) Cookie Manager Pro 导出的裸数组: [{...}, {...}]
-          # 如果是裸数组, 自动包装成 Playwright 格式
-          if isinstance(data, list):
-              print(f"检测到裸 cookie 数组 ({len(data)} 个 cookie), 自动包装为 Playwright storage_state 格式")
-              data = {"cookies": data, "origins": []}
+          data = {"cookies": raw, "origins": []} if isinstance(raw, list) else raw
 
-          if not isinstance(data, dict):
-              print("::error::storage_state 必须是 JSON 对象或数组")
-              raise SystemExit(1)
-
-          # Cookie 字段转换: Cookie Manager Pro 格式 -> Playwright 格式
-          # Cookie Manager Pro: name, value, domain, path, expirationDate, hostOnly,
-          #                     httpOnly, secure, session, storeId, sameSite
-          # Playwright:         name, value, domain, path, expires, httpOnly,
-          #                     secure, sameSite
-          SAMESITE_MAP = {
-              "unspecified": "None",   # Playwright 不接受 unspecified, 用 None 兜底
-              "no_restriction": "None",
-              "lax": "Lax",
-              "strict": "Strict",
-              "none": "None",
-          }
-          converted = 0
+          cleaned = []
           for c in data.get("cookies", []):
-              # expirationDate -> expires (int, -1 表示 session cookie)
-              if "expirationDate" in c and "expires" not in c:
-                  ed = c.pop("expirationDate")
-                  try:
-                      c["expires"] = int(ed) if ed else -1
-                  except (TypeError, ValueError):
-                      c["expires"] = -1
-                  converted += 1
-              # 移除 Playwright 不识别的字段 (保留也无害, 但干净点)
-              for k in ("hostOnly", "storeId", "session"):
-                  c.pop(k, None)
-              # sameSite 大小写规范化
-              ss = c.get("sameSite")
-              if isinstance(ss, str):
-                  c["sameSite"] = SAMESITE_MAP.get(ss.lower(), ss)
-          if converted:
-              print(f"已转换 {converted} 个 cookie 从 Cookie Manager Pro 格式")
-              path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+              ss = str(c.get("sameSite", "")).lower()
+              if ss in ("strict",):
+                  same_site = "Strict"
+              elif ss in ("none", "no_restriction"):
+                  same_site = "None"
+              else:
+                  same_site = "Lax"
 
-          print("storage_state JSON: 合法")
+              expires = c.get("expires", c.get("expirationDate", -1))
+              try:
+                  expires = float(expires) if expires is not None else -1.0
+              except (ValueError, TypeError):
+                  expires = -1.0
 
-          if "cookies" in data:
-              print(f"Cookie 数量: {len(data['cookies'])}")
+              cleaned.append({
+                  "name": str(c.get("name", "")),
+                  "value": str(c.get("value", "")),
+                  "domain": str(c.get("domain", "")),
+                  "path": str(c.get("path", "/")),
+                  "expires": expires,
+                  "httpOnly": bool(c.get("httpOnly", False)),
+                  "secure": bool(c.get("secure", False)),
+                  "sameSite": same_site
+              })
 
-          if "origins" in data:
-              print(f"Origin 数量: {len(data['origins'])}")
+          data["cookies"] = cleaned
+          data["origins"] = data.get("origins", [])
+          path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+          print(f"✅ storage_state 强校验完成，清洗 Cookie: {len(cleaned)} 个")
           PY
 
       - name: 🐛 准备调试输出目录
@@ -394,70 +288,21 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          echo "=========================================="
-          echo "Falix Renew Pro (Falix 自动续期)"
-          echo "=========================================="
-          echo "运行编号: #${{ github.run_number }}"
-          echo "续期阈值: ${RENEW_BELOW_MINUTES:-20} 分钟"
-          echo "代理: ${ALL_PROXY:-直连}"
-          echo "开始运行 renew.py..."
-
           python renew.py
-          PYTHON_EXIT=$?
-
-          # 关键: 清空代理环境变量, 避免后续 Node.js 步骤 (upload-artifact)
-          # 尝试用 SOCKS5 协议 (Node 不支持, 会抛 Invalid URL protocol)
-          echo "ALL_PROXY=" >> $GITHUB_ENV
-          echo "HTTP_PROXY=" >> $GITHUB_ENV
-          echo "HTTPS_PROXY=" >> $GITHUB_ENV
-
-          exit $PYTHON_EXIT
 
       - name: 📝 生成运行摘要
         if: always()
         shell: bash
         run: |
           {
-            echo "# Falix Renew Pro (Falix 自动续期)"
-            echo
-            echo "## 运行信息"
-            echo
+            echo "# Falix Renew Pro 运行摘要"
             echo "- 运行编号: #${{ github.run_number }}"
-            echo "- 工作流: ${{ github.workflow }}"
-            echo "- 触发方式: ${{ github.event_name }}"
-            echo "- 提交: \`${{ github.sha }}\`"
-            echo "- 时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            echo
-            echo "## 结果"
-            echo
-            if [ "${{ job.status }}" = "success" ]; then
-              echo "✅ **续期任务成功完成**"
-            else
-              echo "❌ **续期任务失败**"
-            fi
-            echo
-            echo "## 调试"
-            echo
-            if [ -d "debug_output" ]; then
-              COUNT=$(find debug_output -type f | wc -l)
-              echo "调试文件数: $COUNT"
-            else
-              echo "未找到 debug_output 目录"
-            fi
+            echo "- 状态: ${{ job.status }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 📸 上传调试截图与 HTML
         if: always()
         uses: actions/upload-artifact@v4
-        env:
-          # 显式清空代理环境变量给 upload-artifact@v4 用 (Node undici 解析代理 URL,
-          # socks5h:// 它不支持会抛 "Invalid URL protocol" 错误).
-          # GitHub Actions env key 不区分大小写, 不能同时写 ALL_PROXY 和 all_proxy,
-          # 否则会被拒 "X is already defined". 这里只保留大写形式.
-          ALL_PROXY: ''
-          HTTP_PROXY: ''
-          HTTPS_PROXY: ''
-          NO_PROXY: '*'
         with:
           name: falix-debug-${{ github.run_number }}
           path: debug_output/
