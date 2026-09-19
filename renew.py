@@ -509,7 +509,7 @@ async def process_server(page, server_id):
         threshold = RENEW_BELOW_MINUTES * 60
         if before > threshold:
             log("✅ Timer 尚未低于阈值，无需续期")
-            send_tg(f"⏭️ Falix Timer 充足, 无需续期\nServer ID: {server_id}\nTimer: {format_seconds(before)}")
+            send_tg(f"💗主人，Falix Timer 充足, 无需续期\nServer ID: {server_id}\nTimer: {format_seconds(before)}")
             return True
 
     if not await click_add_time(page, server_id):
