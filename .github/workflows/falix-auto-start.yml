@@ -1,0 +1,935 @@
+name: Falix Auto Start
+
+on:
+  schedule:
+    # 每天 02:17 UTC 运行一次
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  start-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y xvfb
+
+      - name: Cache Chrome
+        id: cache-chrome
+        uses: actions/cache@v5
+        with:
+          path: /tmp/chrome-cache
+          key: chrome-v1
+
+      - name: Install Chrome
+        if: steps.cache-chrome.outputs.cache-hit != 'true'
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -qq && sudo apt-get install -y google-chrome-stable
+          mkdir -p /tmp/chrome-cache
+          sudo cp -a /opt/google/chrome/. /tmp/chrome-cache/
+          sudo chown -R $(whoami) /tmp/chrome-cache
+          google-chrome-stable --version
+
+      - name: Link Chrome
+        if: steps.cache-chrome.outputs.cache-hit == 'true'
+        run: |
+          sudo mkdir -p /opt/google/chrome
+          sudo cp -a /tmp/chrome-cache/. /opt/google/chrome/
+          sudo ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome-stable
+          google-chrome-stable --version
+
+      - name: Enable WARP
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
+
+      - name: Fix DNS
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
+          echo "Exit IP: $(curl -s --max-time 15 https://api.ipify.org || echo 'unreachable')"
+          curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || echo "WARP trace unavailable"
+
+      - name: Cache node_modules
+        id: cache-npm
+        uses: actions/cache@v5
+        with:
+          path: node_modules
+          key: npm-v2
+
+      - name: Restore cookies
+        id: restore-cookies
+        uses: actions/cache/restore@v5
+        with:
+          path: cookies.json
+          key: falix-cookies-${{ github.run_id }}
+          restore-keys: falix-cookies-
+
+      - name: Install Node dependencies
+        if: steps.cache-npm.outputs.cache-hit != 'true'
+        run: npm init -y && npm install puppeteer-real-browser@1.4.4 puppeteer-core@25.7.0
+
+      - name: Write script
+        run: |
+          python3 - << 'PYEOF'
+          script = r"""
+          import { connect } from 'puppeteer-real-browser';
+          import fs from 'fs';
+
+          let fatalCdp = '';
+          process.on('unhandledRejection', reason => {
+            const msg = (reason && reason.message) ? reason.message : String(reason);
+            console.error('unhandledRejection: ' + msg);
+            if (/ProtocolError|timed out|Target closed|Connection closed|Session closed/i.test(msg)) fatalCdp = msg;
+          });
+          process.on('uncaughtException', err => {
+            const msg = (err && err.message) ? err.message : String(err);
+            console.error('uncaughtException: ' + msg);
+            fatalCdp = msg;
+          });
+
+          const EMAIL      = process.env.FALIX_EMAIL;
+          const PASSWORD   = process.env.FALIX_PASSWORD;
+          const SERVER_ID  = process.env.FALIX_SERVER_ID;
+          if (!SERVER_ID) { console.error('FALIX_SERVER_ID 未设置，请在 Settings→Secrets 配置'); process.exit(1); }
+          const TG_TOKEN   = process.env.TG_TOKEN;
+          const TG_CHAT_ID = process.env.TG_CHAT_ID;
+          const LOGIN_URL  = 'https://client.falixnodes.net/auth/login';
+          const SERVER_URL = `https://client.falixnodes.net/server/${SERVER_ID}/console`;
+          const TIMER_URL  = `https://client.falixnodes.net/timer?id=${SERVER_ID}`;
+          const COOKIES_PATH = process.env.COOKIES_PATH || '';
+
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const START = Date.now();
+
+          async function checkTime(label) {
+            const elapsed = Date.now() - START;
+            console.log(`${label}: ${Math.round(elapsed/1000)}s`);
+          }
+
+          async function loadCookies(page) {
+            if (!COOKIES_PATH) return false;
+            try {
+              if (!fs.existsSync(COOKIES_PATH)) return false;
+              const data = fs.readFileSync(COOKIES_PATH, 'utf8');
+              const cookies = JSON.parse(data);
+              if (!cookies || cookies.length === 0) return false;
+              await page.setCookie(...cookies);
+              console.log('已加载 ' + cookies.length + ' 个 cookie');
+              return true;
+            } catch(e) {
+              console.log('加载 cookie 失败: ' + e.message);
+              return false;
+            }
+          }
+
+          async function saveCookies(page) {
+            if (!COOKIES_PATH) return;
+            try {
+              const cookies = await page.cookies();
+              fs.writeFileSync(COOKIES_PATH, JSON.stringify(cookies, null, 2));
+              console.log('已保存 ' + cookies.length + ' 个 cookie');
+            } catch(e) {
+              console.log('保存 cookie 失败: ' + e.message);
+            }
+          }
+          fs.mkdirSync('/tmp/ss', { recursive: true });
+
+          async function shot(page, name) {
+            try {
+              await Promise.race([
+                page.screenshot({ path: `/tmp/ss/${name}.png`, fullPage: true }),
+                new Promise((_,rej) => setTimeout(() => rej(new Error('timeout')), 15000))
+              ]);
+              console.log('shot:' + name);
+            } catch(e) { console.log('shot fail ' + name + ': ' + e.message); }
+          }
+
+          async function tg(msg) {
+            if (!TG_TOKEN || !TG_CHAT_ID) return;
+            try {
+              await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({ chat_id: TG_CHAT_ID, text: msg, parse_mode:'HTML' })
+              });
+            } catch {}
+          }
+
+          async function cdpClick(page, x, y) {
+            const s = await page.target().createCDPSession();
+            try {
+              await s.send('Input.dispatchMouseEvent', { type:'mouseMoved', x, y, button:'none', buttons:0, modifiers:0, clickCount:0 });
+              await sleep(60);
+              await s.send('Input.dispatchMouseEvent', { type:'mousePressed', x, y, button:'left', buttons:1, modifiers:0, clickCount:1 });
+              await sleep(80);
+              await s.send('Input.dispatchMouseEvent', { type:'mouseReleased', x, y, button:'left', buttons:0, modifiers:0, clickCount:1 });
+            } finally { await s.detach().catch(()=>{}); }
+          }
+
+          async function cdpInsertText(page, text) {
+            const s = await page.target().createCDPSession();
+            try {
+              await s.send('Input.insertText', { text });
+            } finally { await s.detach().catch(()=>{}); }
+          }
+
+          async function clearInput(page, selector) {
+            return page.evaluate(sel => {
+              let target = null;
+              for (const part of sel.split(',')) {
+                const e = document.querySelector(part.trim());
+                if (e) { target = e; break; }
+              }
+              if (!target) return false;
+              const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+              setter.call(target, '');
+              target.dispatchEvent(new Event('input', { bubbles: true }));
+              target.dispatchEvent(new Event('change', { bubbles: true }));
+              return true;
+            }, selector).catch(()=>false);
+          }
+
+          async function inputByCoord(page, selector, text, label) {
+            const pos = await page.evaluate(sel => {
+              for (const part of sel.split(',')) {
+                const el = document.querySelector(part.trim());
+                if (!el) continue;
+                el.scrollIntoView({ block: 'center' });
+                const r = el.getBoundingClientRect();
+                if (r.width > 0) return { x: r.x + r.width/2, y: r.y + r.height/2, found: part.trim() };
+              }
+              return null;
+            }, selector);
+            if (!pos) { console.log(label + ': 找不到输入框 ' + selector); return false; }
+            const realSel = pos.found || selector.split(',')[0].trim();
+            await cdpClick(page, pos.x, pos.y);
+            await sleep(400);
+            await clearInput(page, realSel);
+            await sleep(200);
+            await cdpInsertText(page, text);
+            await sleep(400);
+            let ok = await page.evaluate((s, v) => {
+              for (const part of s.split(',')) {
+                const el = document.querySelector(part.trim());
+                if (el && el.value === v) return true;
+              }
+              return false;
+            }, selector, text);
+            if (!ok) {
+              try {
+                await page.focus(realSel);
+                await sleep(200);
+                await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
+                await sleep(100);
+                await page.keyboard.press('Backspace');
+                await sleep(100);
+                await page.keyboard.type(text, { delay: 30 });
+                await sleep(300);
+                ok = await page.evaluate((s, v) => {
+                  for (const part of s.split(',')) {
+                    const el = document.querySelector(part.trim());
+                    if (el && el.value === v) return true;
+                  }
+                  return false;
+                }, selector, text);
+                console.log(label + ': keyboard fallback ' + (ok ? 'OK' : 'fail'));
+              } catch (e) { console.log(label + ' keyboard err: ' + e.message); }
+            }
+            const curLen = await page.evaluate(s => {
+              for (const part of s.split(',')) {
+                const el = document.querySelector(part.trim());
+                if (el) return el.value?.length || 0;
+              }
+              return 0;
+            }, selector);
+            console.log(label + ': ' + (ok ? 'OK' : '不完整') + ' len=' + curLen + ' want=' + text.length);
+            return ok;
+          }
+
+          async function clickBtn(page, label) {
+            return page.evaluate(lbl => {
+              const b = [...document.querySelectorAll('button')]
+                .find(b => b.textContent?.trim().toLowerCase() === lbl);
+              if (b) { b.click(); return true; }
+              return false;
+            }, label);
+          }
+
+          async function clickBtnLike(page, re) {
+            return page.evaluate(src => {
+              const rx = new RegExp(src, 'i');
+              const b = [...document.querySelectorAll('button,[role="button"]')].find(el => {
+                const t = (el.textContent || '').trim().toLowerCase();
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && !el.disabled && rx.test(t);
+              });
+              if (!b) return false;
+              b.click();
+              return true;
+            }, re.source).catch(()=>false);
+          }
+
+          async function waitForReactInput(page, selector, timeoutMs) {
+            timeoutMs = timeoutMs || 20000;
+            const end = Date.now() + timeoutMs;
+            while (Date.now() < end) {
+              const ready = await page.evaluate(sel => {
+                for (const part of sel.split(',')) {
+                  const el = document.querySelector(part.trim());
+                  if (el && Object.keys(el).some(k => k.indexOf('__reactProps$') === 0)) return true;
+                }
+                return false;
+              }, selector).catch(()=>false);
+              if (ready) return true;
+              await sleep(250);
+            }
+            return false;
+          }
+
+          async function readInputValue(page, selector) {
+            return page.evaluate(sel => {
+              for (const part of sel.split(',')) {
+                const el = document.querySelector(part.trim());
+                if (el) return el.value || '';
+              }
+              return '';
+            }, selector).catch(()=>'');
+          }
+
+          async function jsFillInput(page, selector, text) {
+            return page.evaluate((sel, v) => {
+              let el = null;
+              for (const part of sel.split(',')) {
+                const e = document.querySelector(part.trim());
+                if (e && e.getBoundingClientRect().width > 0) { el = e; break; }
+              }
+              if (!el) {
+                for (const part of sel.split(',')) {
+                  const e = document.querySelector(part.trim());
+                  if (e) { el = e; break; }
+                }
+              }
+              if (!el) return 'not-found';
+              const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+              if (!desc || !desc.set) return 'no-setter';
+              const tracker = el._valueTracker;
+              if (tracker) tracker.setValue('');
+              desc.set.call(el, v);
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              return el.value === v ? 'ok' : 'mismatch';
+            }, selector, text).catch(e => 'err:' + e.message);
+          }
+
+          async function safeType(page, selector, text, label) {
+            if (!text) { console.log(label + ': 值为空，跳过'); return false; }
+            const ready = await waitForReactInput(page, selector, 20000);
+            console.log(label + ': React ' + (ready ? 'ready' : '超时未就绪，仍尝试填写'));
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              const how = await jsFillInput(page, selector, text);
+              await sleep(500);
+              const cur = await readInputValue(page, selector);
+              if (how === 'ok' && cur === text) {
+                console.log(label + ': OK (js) len=' + cur.length);
+                return true;
+              }
+              console.log(label + ': js 填写失败(' + how + ') len=' + cur.length + '，尝试键盘，attempt ' + attempt);
+              const ok = await inputByCoord(page, selector, text, label);
+              if (ok) return true;
+              await sleep(500);
+            }
+            console.log(label + ': 3次尝试均失败');
+            return false;
+          }
+
+          async function hasTurnstileToken(page) {
+            return page.evaluate(() => {
+              const els = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+              for (const el of els) if (el.value && el.value.length > 10) return true;
+              return false;
+            }).catch(()=>false);
+          }
+
+          async function solveTurnstile(page, timeoutMs) {
+            timeoutMs = timeoutMs || 30000;
+            const end = Date.now() + timeoutMs;
+            console.log('[turnstile] waiting for auto-solve...');
+            while (Date.now() < end) {
+              if (await hasTurnstileToken(page)) {
+                const token = await page.evaluate(() => {
+                  const el = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+                  return el && el.value ? el.value : null;
+                });
+                console.log('[turnstile] solved, token len=' + (token ? token.length : 0));
+                return true;
+              }
+              await sleep(1000);
+            }
+            console.log('[turnstile] unconfirmed (timeout)');
+            return false;
+          }
+
+          async function getStatus(page) {
+            return page.evaluate(() => {
+              function w(root) {
+                const it = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                let n;
+                while ((n = it.nextNode())) {
+                  const t = n.textContent.trim().toLowerCase();
+                  if (t==='offline'||t==='离线'||t==='已停止') return 'offline';
+                  if (t==='starting'||t==='启动中'||t==='正在启动') return 'starting';
+                  if (t==='online'||t==='running'||t==='在线'||t==='运行中') return 'online';
+                }
+                return null;
+              }
+              for (const s of ['.server-status','[class*="status"]','[class*="badge"]','.badge'])
+                for (const el of document.querySelectorAll(s)) { const r=w(el); if(r) return r; }
+              return w(document.body) || 'unknown';
+            });
+          }
+
+          async function getRemainingTime(page) {
+            const r = await page.evaluate(() => {
+              const norm = s => ((s || '').replace(/\u00a0/g, ' ')).trim();
+              function parseTimerText(t) {
+                t = norm(t);
+                if (!t) return -1;
+                const hms = t.match(/(\d{1,4}):([0-5]\d):([0-5]\d)/);
+                if (hms) return (+hms[1]) * 3600 + (+hms[2]) * 60 + (+hms[3]);
+                let h = 0, m = 0, s = 0, hit = false, mm;
+                if ((mm = t.match(/(\d{1,4})\s*(?:hours?|hrs?|h|小时|时)(?![a-zA-Z])/i))) { h = +mm[1]; hit = true; }
+                if ((mm = t.match(/(\d{1,4})\s*(?:minutes?|mins?|分钟|分)(?![a-zA-Z])/i)) ||
+                    (mm = t.match(/(\d{1,4})\s*m(?![a-zA-Z])/))) { m = +mm[1]; hit = true; }
+                if ((mm = t.match(/(\d{1,4})\s*(?:seconds?|secs?|秒)(?![a-zA-Z])/i)) ||
+                    (mm = t.match(/(\d{1,4})\s*s(?![a-zA-Z])/))) { s = +mm[1]; hit = true; }
+                if (hit) return h * 3600 + m * 60 + s;
+                return -1;
+              }
+              const KW = ['remain', 'left', 'expire', 'countdown', 'timer', '计时器', '续订', '剩余', '倒计时', '续期', '到期'];
+              const els = document.querySelectorAll('body *');
+              for (const el of els) {
+                if (el.children.length > 0) continue;
+                const t = norm(el.innerText || el.textContent);
+                if (!t || t.length > 80) continue;
+                const low = t.toLowerCase();
+                if (!KW.some(k => low.includes(k))) continue;
+                let node = el;
+                for (let lvl = 0; lvl <= 2; lvl++) {
+                  const pt = norm(node.innerText || node.textContent);
+                  if (pt && pt.length <= 300) {
+                    const v = parseTimerText(pt);
+                    if (v >= 0) return { v, how: 'keyword-lvl' + lvl, sample: pt.substring(0, 80) };
+                  }
+                  if (!node.parentElement) break;
+                  node = node.parentElement;
+                }
+              }
+              for (const el of document.querySelectorAll('body *')) {
+                if (el.children.length > 0) continue;
+                const t = norm(el.innerText || el.textContent);
+                if (!t || t.length > 80) continue;
+                if (!/(小时|时|hours?|hrs?)/i.test(t)) continue;
+                if (!/(分钟|分|minutes?|mins?)/i.test(t)) continue;
+                if (!/(秒|seconds?|secs?)/i.test(t)) continue;
+                const v = parseTimerText(t);
+                if (v >= 0) return { v, how: 'leaf-hms', sample: t.substring(0, 80) };
+              }
+              const body = norm(document.body.innerText);
+              const all = body.match(/\d{1,4}:[0-5]\d:[0-5]\d/g) || [];
+              if (all.length > 0) {
+                const p = all[0].split(':');
+                return { v: (+p[0]) * 3600 + (+p[1]) * 60 + (+p[2]), how: 'fallback-first-hms', sample: all[0] };
+              }
+              return { v: -1, how: 'none', sample: body.substring(0, 80) };
+            }).catch(() => ({ v: -1, how: 'evaluate-err', sample: '' }));
+            console.log('parse time: v=' + r.v + ' via=' + r.how + ' sample=' + (r.sample || '').substring(0, 60));
+            return r.v;
+          }
+
+          async function dumpUi(page, tag) {
+            const info = await page.evaluate(() => {
+              const vis = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+              const btns = [...document.querySelectorAll('button,[role="button"],a')].filter(vis).map(el => ({
+                t: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 50),
+                href: el.getAttribute('href') || '',
+                cls: String(el.className || '').slice(0, 40),
+                aria: el.getAttribute('aria-label') || '',
+                title: el.getAttribute('title') || '',
+                dis: !!el.disabled
+              })).filter(x => x.t || x.href);
+              const dlg = [...document.querySelectorAll('[role="dialog"],[class*="modal"],[class*="Modal"],[class*="dialog"],[class*="Dialog"]')].filter(vis).map(el => (el.innerText || '').replace(/\s+/g, ' ').slice(0, 300));
+              const ifr = [...document.querySelectorAll('iframe')].map(f => (f.src || '').slice(0, 100));
+              const text = (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 1500);
+              const nums = [...document.querySelectorAll('body *')].filter(el => !el.children.length).map(el => (el.textContent || '').trim()).filter(t => t && t.length < 40 && /[0-9]/.test(t) && /(小时|时|分|秒|hour|min|sec|day|天)/i.test(t));
+              return { url: location.href, btns: btns.slice(0, 60), dlg, ifr, nums: [...new Set(nums)].slice(0, 30), text };
+            }).catch(e => ({ err: e.message }));
+            console.log('UI[' + tag + '] ' + JSON.stringify(info));
+          }
+
+          async function tryAdRound(page, label) {
+            const wp = await clickBtn(page, 'watch ad') || await clickBtn(page, '观看广告');
+            if (!wp) {
+              console.log(label + ': no watch ad button found');
+              await shot(page, label + '_no_ad').catch(()=>{});
+              return 'no_ad_btn';
+            }
+            console.log(label + ': click watch ad ok');
+            await shot(page, label + '_ad_modal').catch(()=>{});
+            await sleep(5000);
+
+            const playResult = await page.evaluate(() => {
+              const v = document.querySelector('video');
+              if (v) { v.play().catch(()=>{}); return 'video-play'; }
+              const vjs = document.querySelector('.vjs-big-play-button');
+              if (vjs && vjs.offsetWidth > 0) { vjs.click(); return 'vjs-play'; }
+              const btns = [...document.querySelectorAll('button')];
+              const play = btns.find(b => {
+                const t = (b.textContent || '').trim().toLowerCase();
+                return t.includes('play video') || t === 'play';
+              });
+              if (play) { play.click(); return 'btn-play'; }
+              return null;
+            }).catch(()=>null);
+            console.log(label + ' play click: ' + playResult);
+
+            let alreadyExt = false;
+            const urlBeforeAd = page.url();
+            const adDeadline = Date.now() + 90000;
+            let lastPlayAt = 0;
+            let sawSrc = false;
+            while (Date.now() < adDeadline) {
+              await sleep(2000);
+              try {
+                const state = await page.evaluate(() => {
+                  const v = document.querySelector('video');
+                  if (!v) return null;
+                  return { paused: v.paused, ct: v.currentTime|0, dur: v.duration|0, ended: v.ended, rs: v.readyState, hasSrc: !!(v.currentSrc || v.src) };
+                }).catch(()=>null);
+                if (state) {
+                  if (state.hasSrc && !sawSrc) { sawSrc = true; console.log(label + ': video src loaded'); }
+                  if (!state.paused && state.ct > 0) {
+                    console.log(label + ' ad playing: ' + state.ct + '/' + state.dur + 's');
+                  }
+                  if (state.paused && state.hasSrc && Date.now() - lastPlayAt > 5000) {
+                    lastPlayAt = Date.now();
+                    await page.evaluate(() => { const v = document.querySelector('video'); if (v) v.play().catch(()=>{}); }).catch(()=>{});
+                    console.log(label + ': re-play called');
+                  }
+                  if (state.ended || (state.ct >= state.dur && state.dur > 0)) {
+                    console.log(label + ': ad video ended');
+                    await sleep(3000);
+                    break;
+                  }
+                }
+                const txt = await page.evaluate(() => document.body.innerText.substring(0,500)).catch(()=>'');
+                if (txt.includes('Timer has been extended') || txt.includes('extended') || txt.includes('计时器已')) {
+                  console.log(label + ': timer extended during ad wait');
+                  alreadyExt = true;
+                  break;
+                }
+                const cur = page.url();
+                if (!urlBeforeAd.includes('timer?id=') && cur.includes('timer?id=')) {
+                  console.log(label + ': back on timer page');
+                  break;
+                }
+              } catch(e) {}
+            }
+            if (!sawSrc) console.log(label + ': video never got a src');
+            try { await page.bringToFront(); } catch(e) {}
+
+            if (alreadyExt) {
+              await shot(page, label + '_result').catch(()=>{});
+              return 'ok';
+            }
+            return 'unconfirmed';
+          }
+
+          async function doExtend(page, browser) {
+            console.log('=== TIMER EXTEND ===');
+            const CAP = 168 * 3600;
+            let lastKnown = -1;
+            let totalGain = 0;
+
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              await page.goto(TIMER_URL, { waitUntil:'domcontentloaded', timeout:30000 }).catch(()=>{});
+              await sleep(3000);
+              await page.evaluate(() => {
+                const btns = [...document.querySelectorAll('button')];
+                const accept = btns.find(b => b.textContent.includes('Accept all') || b.textContent.includes('接受全部') || b.textContent.includes('接受所有'));
+                if (accept) { accept.click(); console.log('gdpr accepted'); }
+              }).catch(()=>{});
+              await sleep(1500);
+              if (attempt === 1) await shot(page, 'timer_01_loaded').catch(()=>{});
+
+              await solveTurnstile(page, 25000);
+              await sleep(1000);
+              if (attempt === 1) await shot(page, 'timer_02_turnstile').catch(()=>{});
+
+              const before = await getRemainingTime(page);
+              if (before >= 0) lastKnown = before;
+              console.log('timer before click (attempt ' + attempt + '): ' + before + 's');
+
+              const tp = await clickBtn(page, 'add time') || await clickBtn(page, '添加时间');
+              if (!tp) {
+                console.log('no extend button found');
+                await shot(page, 'timer_03_no_btn').catch(()=>{});
+                return 'no_btn';
+              }
+              console.log('click add time ok (attempt ' + attempt + ')');
+              await sleep(3000);
+              await shot(page, 'timer_add_' + attempt).catch(()=>{});
+
+              const hasAd = await page.evaluate(() => [...document.querySelectorAll('button')].some(b => {
+                const t = (b.textContent || '').trim().toLowerCase();
+                return t === 'watch ad' || t === '观看广告';
+              })).catch(()=>false);
+              if (hasAd) {
+                const r = await tryAdRound(page, 'ad' + attempt);
+                if (r === 'ok') return 'ok';
+              }
+
+              await page.goto(TIMER_URL, { waitUntil:'domcontentloaded', timeout:30000 }).catch(()=>{});
+              await sleep(2500);
+              await solveTurnstile(page, 15000);
+              await sleep(1000);
+              const after = await getRemainingTime(page);
+              console.log('timer after click (attempt ' + attempt + '): ' + after + 's');
+              await shot(page, 'timer_after_' + attempt).catch(()=>{});
+
+              if (before >= 0 && after > before) {
+                totalGain += after - before;
+                console.log('timer extend success (gain=' + (after - before) + 's, total=' + totalGain + 's)');
+              }
+              if (after >= CAP - 3600) {
+                console.log('timer near cap (~' + Math.floor(after/3600) + 'h), stop');
+                return totalGain > 0 ? 'ok' : 'capped';
+              }
+              if (after >= 0) lastKnown = after;
+              if (after <= before && totalGain > 0) {
+                console.log('timer not increased on attempt ' + attempt + ', stop (limit/cooldown)');
+                break;
+              }
+              console.log('timer not increased on attempt ' + attempt + ', retrying...');
+            }
+
+            if (totalGain > 0) return 'ok';
+            await dumpUi(page, 'extend_unconfirmed');
+            console.log('extend unconfirmed (lastKnown=' + lastKnown + 's)');
+            return 'unconfirmed';
+          }
+
+          async function doStart(page) {
+            for (let round = 1; round <= 3; round++) {
+              try {
+                console.log('--- round ' + round + '/3 ---');
+                const sp = await clickBtn(page, 'start') || await clickBtn(page, '启动');
+                if (!sp) { console.log('no start btn'); break; }
+                console.log('click start ok');
+
+                let adClicked = false;
+                for (let w = 0; w < 60; w++) {
+                  await sleep(500);
+                  if (w % 4 === 3) {
+                    const early = await getStatus(page).catch(()=>null);
+                    if (early === 'starting' || early === 'online') {
+                      console.log('server already ' + early + ' without ad');
+                      return early;
+                    }
+                  }
+                  const ap = await clickBtnLike(page, /watch ad|观看广告|看广告/i).catch(()=>false);
+                  if (ap) {
+                    await sleep(1000);
+                    const ap2 = await clickBtnLike(page, /watch ad|观看广告|看广告/i).catch(()=>false);
+                    if (ap2) {
+                      await shot(page, 'ad_' + round);
+                      console.log('click watch ad ok');
+                      adClicked = true;
+                    }
+                    break;
+                  }
+                }
+                const hasMedia = await page.evaluate(() => !!(document.querySelector('video') || document.querySelector('.vjs-big-play-button'))).catch(()=>false);
+                if (!adClicked && !hasMedia) console.log('no ad modal');
+
+                let playResult = 'skipped(no ad)';
+                if (adClicked || hasMedia) {
+                  await sleep(3000);
+                  playResult = await page.evaluate(() => {
+                    const v = document.querySelector('video');
+                    if (v) { v.play().catch(()=>{}); return 'video-play'; }
+                    const vjs = document.querySelector('.vjs-big-play-button');
+                    if (vjs && vjs.offsetWidth > 0) { vjs.click(); return 'vjs-play'; }
+                    const btns = [...document.querySelectorAll('button')];
+                    const play = btns.find(b => {
+                      const t = (b.textContent || '').trim().toLowerCase();
+                      return t.includes('play video') || t === 'play' || t.includes('播放');
+                    });
+                    if (play) { play.click(); return 'btn-play'; }
+                    return null;
+                  }).catch(()=>null);
+                }
+                console.log('play click: ' + playResult);
+
+                console.log('waiting 30s...');
+                for (let s = 5; s <= 30; s += 5) {
+                  await sleep(5000);
+                  console.log(s + '/30s');
+                  if (fatalCdp) { console.log('CDP fault during wait: ' + fatalCdp); break; }
+                }
+
+                await page.reload({ waitUntil: 'domcontentloaded' }).catch(()=>{});
+                await sleep(2000);
+                const st = await getStatus(page).catch(()=> 'unknown');
+                console.log('status: ' + st);
+                await shot(page, 'round' + round + '_' + st);
+                if (st === 'starting' || st === 'online') return st;
+                if (round < 3) await sleep(2000);
+              } catch(e) {
+                console.log('round ' + round + ' err: ' + (e && e.message ? e.message : e));
+                await shot(page, 'round' + round + '_err').catch(()=>{});
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(()=>{});
+                await sleep(3000);
+              }
+            }
+            return await getStatus(page).catch(()=> 'unknown');
+          }
+
+          const { browser, page } = await connect({
+            headless: false, turnstile: true, disableXvfb: false,
+            args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1280,800','--autoplay-policy=no-user-gesture-required'],
+            customConfig: { chromePath: '/usr/bin/google-chrome-stable' },
+            connectOption: { defaultViewport: { width:1280, height:800 }, protocolTimeout: 300000 },
+          });
+          console.log('browser ok');
+
+          page.on('response', async res => {
+            try {
+              const u = res.url();
+              if (!/timer|extend|renew|add.?time|cooldown/i.test(u)) return;
+              const req = res.request();
+              let pick = '';
+              const ct = (res.headers()['content-type'] || '');
+              if (ct.includes('json')) {
+                const j = await res.json().catch(()=>null);
+                if (j && typeof j === 'object' && !Array.isArray(j)) {
+                  const o = {};
+                  for (const [k, v] of Object.entries(j)) {
+                    if (/time|add|extend|remain|cooldown|limit|error|message|success/i.test(k)) o[k] = v;
+                  }
+                  pick = JSON.stringify(o).slice(0, 300);
+                }
+              }
+              console.log('API ' + req.method() + ' ' + res.status() + ' ' + u.substring(0, 160) + ' ' + pick);
+            } catch(e) {}
+          });
+
+          try {
+            let loggedIn = false;
+
+            const cookieLoaded = await loadCookies(page);
+            if (cookieLoaded) {
+              await page.goto(SERVER_URL, { waitUntil:'domcontentloaded', timeout:30000 }).catch(()=>{});
+              await sleep(3000);
+              const url = page.url();
+              if (url.includes('/server/') && !url.includes('/auth/login')) {
+                console.log('cookie 有效，直接进入控制台');
+                loggedIn = true;
+              } else {
+                console.log('cookie 已过期，需要重新登录');
+              }
+            }
+
+            if (!loggedIn) {
+              await page.goto(LOGIN_URL, { waitUntil:'domcontentloaded', timeout:30000 });
+              await page.waitForSelector('input[name="email"], input[type="email"]', { timeout:30000 }).catch(()=>{});
+              await sleep(1000);
+              await shot(page, '01_login');
+
+              const emailOk = await safeType(page, 'input[name="email"], input#email, input[name="email-address"], input[type="email"], input[id="email-address"]', EMAIL, 'email');
+              const passOk = await safeType(page, 'input[name="password"], input#password, input[type="password"], input[id="password"]', PASSWORD, 'password');
+              await sleep(500);
+              await shot(page, '02_creds');
+              if (!emailOk || !passOk) throw new Error('登录表单填写失败: email=' + emailOk + ' password=' + passOk);
+
+              const tOk = await solveTurnstile(page, 15000);
+              console.log(tOk ? 'login turnstile ok' : 'login turnstile unconfirmed');
+              await shot(page, '03_turnstile');
+
+              const lp = await clickBtn(page, 'sign in') || await clickBtn(page, '登录');
+              if (!lp) await page.keyboard.press('Enter');
+
+              try { await page.waitForNavigation({ timeout:20000, waitUntil:'domcontentloaded' }); } catch { await sleep(5000); }
+              await shot(page, '04_after_login');
+
+              if (page.url().includes('/auth/2fa')) {
+                console.log('login requires 2FA: ' + page.url());
+                await tg('❌ <b>Falix</b> 登录需要 2FA，脚本无法自动完成');
+                throw new Error('账号启用了 2FA（' + page.url() + '），请关闭 2FA 或改用 cookie');
+              }
+
+              if (page.url().includes('/auth/login')) {
+                const err = await page.evaluate(()=>[...document.querySelectorAll('.invalid-feedback,.alert,.error,[role="alert"]')].map(e=>e.textContent?.trim()).filter(Boolean).join('|')).catch(()=>'');
+                console.log('login failed: ' + err);
+                await tg('❌ <b>Falix</b> 登录失败: ' + err);
+                process.exit(1);
+              }
+              console.log('login ok');
+              await saveCookies(page);
+              try { fs.writeFileSync('fresh-login.flag', String(Date.now())); } catch(e) { console.log('写 fresh-login.flag 失败: ' + e.message); }
+              await checkTime('login');
+            }
+
+            await page.goto(SERVER_URL, { waitUntil:'domcontentloaded', timeout:30000 });
+            await sleep(3000);
+            await shot(page, '05_console');
+            await dumpUi(page, 'console');
+
+            const st = await getStatus(page);
+            console.log('status: ' + st);
+            await checkTime('status');
+
+            if (st === 'starting' || st === 'online') {
+              await tg('✅ <b>Falix</b> 状态 <code>' + st + '</code>，无需操作');
+              console.log('already running');
+            } else {
+              const final = await doStart(page);
+              if (final === 'starting' || final === 'online') {
+                await tg('✅ <b>Falix</b> 启动成功，状态: <code>' + final + '</code>');
+                console.log('start success');
+              } else {
+                await tg('⚠️ <b>Falix</b> 三次后仍为 <code>' + final + '</code>');
+                console.log('still: ' + final);
+              }
+            }
+
+            await page.goto(TIMER_URL, { waitUntil:'domcontentloaded', timeout:30000 }).catch(()=>{});
+            await sleep(3000);
+            const timeBefore = await getRemainingTime(page);
+            console.log('time before extend: ' + timeBefore + 's');
+
+            const ext = await doExtend(page, browser);
+            await checkTime('extend');
+
+            await page.goto(TIMER_URL, { timeout:15000 }).catch(()=>{});
+            await sleep(3000);
+            const timeAfter = await getRemainingTime(page);
+            console.log('time after extend: ' + timeAfter + 's (ext=' + ext + ')');
+            const fmt = s => Math.floor(s/3600) + 'h' + Math.floor(s%3600/60) + 'm';
+            const CAP = 168 * 3600;
+            if (timeAfter > timeBefore && timeBefore > 0 && timeAfter > 0) {
+              const gain = timeAfter - timeBefore;
+              await tg('✅ <b>Falix</b> 计时器已续期: ' + fmt(timeBefore) + '(' + timeBefore + 's) → ' + fmt(timeAfter) + '(' + timeAfter + 's) +' + gain + 's');
+              console.log('timer extend success (verified gain=' + gain + ')');
+            } else if (ext === 'capped' || timeAfter >= CAP - 3600) {
+              await tg('✅ <b>Falix</b> 计时器接近上限: ' + fmt(timeAfter) + '，无需续期');
+              console.log('timer already near cap (' + timeAfter + 's)');
+            } else if (timeAfter > 0 && timeBefore === -1) {
+              await tg('✅ <b>Falix</b> 计时器读数: ' + fmt(timeAfter) + '（续期状态: ' + ext + '）');
+              console.log('timer extend result (timeBefore unknown)');
+            } else if (ext === 'ok') {
+              await tg('✅ <b>Falix</b> 计时器已续期（时间校验: ' + timeBefore + '→' + timeAfter + '）');
+              console.log('timer extend success (unverified)');
+            } else if (timeAfter === timeBefore && timeAfter > 0) {
+              await tg('⚠️ <b>Falix</b> 计时器时间未增加: ' + timeBefore + 's → ' + timeAfter + 's (ext=' + ext + ')');
+              console.log('timer extend failed (time unchanged, ext=' + ext + ')');
+            } else {
+              await tg('⚠️ <b>Falix</b> 计时器续期失败: <code>' + ext + '</code>（' + timeBefore + '→' + timeAfter + '）');
+              console.log('timer extend failed: ' + ext);
+            }
+          } catch(e) {
+            const msg = (e && e.message) ? e.message : String(e);
+            console.error('error: ' + msg);
+            await shot(page, 'error').catch(()=>{});
+            await tg('❌ <b>Falix</b> 出错: ' + msg);
+            const retryable = /ProtocolError|timed out|Target closed|Connection closed|Session closed/i.test(msg);
+            process.exit(retryable ? 2 : 1);
+          } finally {
+            await browser.close().catch(()=>{});
+          }
+          """
+          import os
+          cwd = os.environ.get('GITHUB_WORKSPACE', os.getcwd())
+          path = os.path.join(cwd, 'run.mjs')
+          with open(path, 'w') as f:
+              f.write(script.strip())
+          print('written to: ' + path)
+          PYEOF
+
+      - name: Run script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
+          FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
+          FALIX_SERVER_ID: ${{ secrets.FALIX_SERVER_ID }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          COOKIES_PATH: ${{ github.workspace }}/cookies.json
+        run: |
+          attempt=1
+          while true; do
+            code=0
+            node run.mjs || code=$?
+            if [ "$code" -eq 0 ]; then
+              break
+            fi
+            if [ "$code" -eq 2 ] && [ "$attempt" -lt 2 ]; then
+              attempt=$((attempt + 1))
+              echo "CDP 故障（exit 2），5s 后第 ${attempt}/2 次重试..."
+              sleep 5
+              continue
+            fi
+            exit "$code"
+          done
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: screenshots
+          path: /tmp/ss/
+          retention-days: 3
+
+      - name: Save cookies
+        if: always() && hashFiles('cookies.json') != ''
+        uses: actions/cache/save@v5
+        with:
+          path: cookies.json
+          key: falix-cookies-${{ github.run_id }}
+
+      - name: Cleanup old runs
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          current="${{ github.run_id }}"
+          ids=$(gh api "repos/${{ github.repository }}/actions/workflows/falix-auto-start.yml/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(.status == "completed") | .id' | grep -v "^${current}$")
+          keep=$(echo "$ids" | sort -nr | head -n 3)
+          for id in $ids; do
+            if ! echo "$keep" | grep -qx "$id"; then
+              echo "deleting run $id"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id" || true
+            fi
+          done
