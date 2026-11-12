@@ -1,0 +1,37 @@
+name: GitHub Actions Keep Alive (Bulletproof)
+
+on:
+  schedule:
+    # 避开整点拥堵时段，每 3 天 UTC 03:17 触发
+    - cron: '17 3 */3 * *'
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Auto Commit to Keep Alive
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          mkdir -p .github
+          echo "Last active: $(date)" > .github/keep-alive.txt
+
+          git add .github/keep-alive.txt
+
+          if git diff --staged --quiet; then
+            echo "No changes detected."
+          else
+            git commit -m "chore: github actions keep alive [skip ci]"
+            git pull --rebase origin ${{ github.ref_name }}
+            git push origin HEAD:${{ github.ref }}
+          fi
