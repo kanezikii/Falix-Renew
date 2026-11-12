@@ -40,8 +40,8 @@ jobs:
       - name: Install Chrome
         if: steps.cache-chrome.outputs.cache-hit != 'true'
         run: |
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update -qq && sudo apt-get install -y google-chrome-stable
           mkdir -p /tmp/chrome-cache
           sudo cp -a /opt/google/chrome/. /tmp/chrome-cache/
@@ -925,10 +925,10 @@ jobs:
         run: |
           current="${{ github.run_id }}"
           ids=$(gh api "repos/${{ github.repository }}/actions/workflows/falix-auto-start.yml/runs?per_page=100" \
-            --jq '.workflow_runs[] | select(.status == "completed") | .id' | grep -v "^${current}$")
+            --jq '.workflow_runs[] | select(.status == "completed") | .id' | grep -v "^${current}$" || true)
           keep=$(echo "$ids" | sort -nr | head -n 3)
           for id in $ids; do
-            if ! echo "$keep" | grep -qx "$id"; then
+            if [ -n "$id" ] && ! echo "$keep" | grep -qx "$id"; then
               echo "deleting run $id"
               gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id" || true
             fi
