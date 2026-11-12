@@ -40,9 +40,9 @@ jobs:
       - name: Install Chrome
         if: steps.cache-chrome.outputs.cache-hit != 'true'
         run: |
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update -qq && sudo apt-get install -y google-chrome-stable
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+          rm -f google-chrome-stable_current_amd64.deb
           mkdir -p /tmp/chrome-cache
           sudo cp -a /opt/google/chrome/. /tmp/chrome-cache/
           sudo chown -R $(whoami) /tmp/chrome-cache
