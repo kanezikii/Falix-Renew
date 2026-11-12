@@ -493,9 +493,10 @@ jobs:
             console.log(`${label}: ${Math.round(elapsed/1000)}s`);
           }
 
-          function sanitizeCookies(rawList) {
+          function sanitizeCookies(rawList, stripCf = false) {
             return rawList
               .filter(c => c && typeof c === 'object' && c.name && c.value !== undefined)
+              .filter(c => !stripCf || !['cf_clearance', '__cf_bm'].includes(String(c.name)))
               .map(c => {
                 const out = {
                   name: String(c.name),
@@ -516,19 +517,23 @@ jobs:
           async function loadCookies(page, forceSecret = false) {
             if (!COOKIES_PATH) return false;
             try {
+              let fromSecret = false;
               if (forceSecret) {
                 if (!process.env.FALIX_COOKIES) return false;
                 fs.writeFileSync(COOKIES_PATH, process.env.FALIX_COOKIES.trim());
+                fromSecret = true;
                 console.log('已使用 FALIX_COOKIES Secret 覆盖本地缓存');
               } else if (!fs.existsSync(COOKIES_PATH) && process.env.FALIX_COOKIES) {
                 fs.writeFileSync(COOKIES_PATH, process.env.FALIX_COOKIES.trim());
+                fromSecret = true;
                 console.log('已从 FALIX_COOKIES Secret 初始化 cookie 文件');
               }
               if (!fs.existsSync(COOKIES_PATH)) return false;
               const data = fs.readFileSync(COOKIES_PATH, 'utf8');
               const cookies = JSON.parse(data);
               if (!Array.isArray(cookies) || cookies.length === 0) return false;
-              const cleanCookies = sanitizeCookies(cookies);
+              // 来自本地导出的 Secret 时剔除绑定本地环境指纹的 cf_clearance，保留会话 Cookie
+              const cleanCookies = sanitizeCookies(cookies, fromSecret);
               if (cleanCookies.length === 0) return false;
               await page.setCookie(...cleanCookies);
               console.log('已加载 ' + cleanCookies.length + ' 个 cookie');
@@ -784,6 +789,28 @@ jobs:
 
           async function clickTurnstileBox(page) {
             try {
+              // 1. 优先检测降级后的原生蓝色验证按钮 ("Verify you are human")
+              const btnPos = await page.evaluate(() => {
+                const candidates = [...document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"], a')];
+                for (const el of candidates) {
+                  const label = (el.innerText || el.textContent || el.value || '').trim();
+                  if (/verify you are human|确认您是真人/i.test(label)) {
+                    el.scrollIntoView({ block: 'center' });
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                      return { x: r.x + r.width / 2, y: r.y + r.height / 2, label };
+                    }
+                  }
+                }
+                return null;
+              }).catch(() => null);
+              if (btnPos) {
+                console.log(`[turnstile] clicking verify button "${btnPos.label}" at (${Math.round(btnPos.x)}, ${Math.round(btnPos.y)})`);
+                await cdpClick(page, btnPos.x, btnPos.y);
+                return true;
+              }
+
+              // 2. 检测标准 Turnstile iframe
               const frames = page.frames();
               for (const f of frames) {
                 if (f.url().includes('challenges.cloudflare.com')) {
@@ -800,6 +827,8 @@ jobs:
                   }
                 }
               }
+
+              // 3. 兜底查找 .cf-turnstile 容器
               const pos = await page.evaluate(() => {
                 const el = document.querySelector('.cf-turnstile, [data-sitekey], iframe[src*="challenges.cloudflare.com"]');
                 if (!el) return null;
@@ -843,7 +872,7 @@ jobs:
                 lastLog = Date.now();
                 console.log(`[cf] waiting (${elapsed}s/${Math.round(timeoutMs / 1000)}s): ${st.snippet || st.readyState}`);
               }
-              if (!st.isBlankLoading && !st.isSpinningOnly && elapsed >= 15 && Date.now() - lastClick > 25000) {
+              if (!st.isBlankLoading && !st.isSpinningOnly && elapsed >= 5 && Date.now() - lastClick > 10000) {
                 lastClick = Date.now();
                 await clickTurnstileBox(page);
               }
@@ -880,7 +909,7 @@ jobs:
                 return true;
               }
               const elapsed = Date.now() - start;
-              if ((clickCount === 0 && elapsed > 8000) || (clickCount === 1 && elapsed > 32000)) {
+              if ((clickCount === 0 && elapsed > 6000) || (clickCount === 1 && elapsed > 25000)) {
                 clickCount++;
                 await clickTurnstileBox(page);
               }
@@ -1223,13 +1252,15 @@ jobs:
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-gpu',
             '--window-size=1280,800',
-            '--autoplay-policy=no-user-gesture-required'
+            '--autoplay-policy=no-user-gesture-required',
+            '--enable-webgl',
           ];
           if (process.env.BROWSER_PROXY) {
             chromeArgs.push(`--proxy-server=${process.env.BROWSER_PROXY}`);
-            console.log('Chrome using proxy: ' + process.env.BROWSER_PROXY);
+            chromeArgs.push('--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1');
+            chromeArgs.push('--force-webrtc-ip-handling-policy=disable_non_proxied_udp');
+            console.log('Chrome using proxy (WebRTC/DNS leak protected): ' + process.env.BROWSER_PROXY);
           }
 
           const { browser, page } = await connect({
