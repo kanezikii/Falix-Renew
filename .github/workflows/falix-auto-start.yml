@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   start-server:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -28,7 +28,34 @@ jobs:
           node-version: '22'
 
       - name: Install system dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y xvfb
+        run: sudo apt-get update -qq && sudo apt-get install -y xvfb libnss3 libgbm1 libasound2t64 fonts-liberation
+
+      - name: Cache Chrome
+        id: cache-chrome
+        uses: actions/cache@v5
+        with:
+          path: /tmp/chrome-cache
+          key: chrome-ubuntu24-v1
+
+      - name: Install Chrome
+        if: steps.cache-chrome.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+          rm -f google-chrome-stable_current_amd64.deb
+          mkdir -p /tmp/chrome-cache
+          sudo cp -a /opt/google/chrome/. /tmp/chrome-cache/
+          sudo chown -R $(whoami) /tmp/chrome-cache
+          google-chrome --version
+
+      - name: Link Chrome
+        if: steps.cache-chrome.outputs.cache-hit == 'true'
+        run: |
+          sudo mkdir -p /opt/google/chrome
+          sudo cp -a /tmp/chrome-cache/. /opt/google/chrome/
+          sudo ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome
+          sudo ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome-stable
+          google-chrome --version
 
       - name: Cache Mihomo
         id: cache-mihomo
@@ -417,22 +444,9 @@ jobs:
           path: node_modules
           key: npm-patchright-v1
 
-      - name: Cache Patchright browser
-        id: cache-browser
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/ms-playwright
-          key: patchright-chromium-v1
-
       - name: Install Patchright
-        run: |
-          if [ "${{ steps.cache-npm.outputs.cache-hit }}" != "true" ]; then
-            npm init -y && npm install patchright@1.51.0
-          fi
-          if [ "${{ steps.cache-browser.outputs.cache-hit }}" != "true" ]; then
-            npx patchright install chromium
-          fi
-          npx patchright install-deps chromium
+        if: steps.cache-npm.outputs.cache-hit != 'true'
+        run: npm init -y && npm install patchright@1.51.0
 
       - name: Restore cookies
         id: restore-cookies
@@ -1101,6 +1115,7 @@ jobs:
 
           fs.rmSync('/tmp/chrome-profile', { recursive: true, force: true });
           const launchOpts = {
+            channel: 'chrome',
             headless: false,
             viewport: { width: 1280, height: 800 },
             args: [
@@ -1114,12 +1129,12 @@ jobs:
           if (process.env.BROWSER_PROXY) {
             launchOpts.proxy = { server: process.env.BROWSER_PROXY };
             launchOpts.args.push('--force-webrtc-ip-handling-policy=disable_non_proxied_udp');
-            console.log('Patchright using proxy: ' + process.env.BROWSER_PROXY);
+            console.log('Patchright (Chrome) using proxy: ' + process.env.BROWSER_PROXY);
           }
 
           const context = await chromium.launchPersistentContext('/tmp/chrome-profile', launchOpts);
           const page = context.pages()[0] || await context.newPage();
-          console.log('patchright browser ok');
+          console.log('patchright chrome ok');
 
           page.on('response', async res => {
             try {
