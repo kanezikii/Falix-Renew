@@ -495,6 +495,7 @@ jobs:
           }
 
           function sanitizeCookies(rawList, stripCf = false) {
+            const ssMap = { strict: 'Strict', lax: 'Lax', none: 'None', no_restriction: 'None' };
             return rawList
               .filter(c => c && typeof c === 'object' && c.name && c.value !== undefined)
               .filter(c => !stripCf || !['cf_clearance', '__cf_bm'].includes(String(c.name)))
@@ -510,7 +511,8 @@ jobs:
                 else if (typeof c.expirationDate === 'number' && c.expirationDate > 0) out.expires = c.expirationDate;
                 if (typeof c.httpOnly === 'boolean') out.httpOnly = c.httpOnly;
                 if (typeof c.secure === 'boolean') out.secure = c.secure;
-                if (['Strict', 'Lax', 'None'].includes(c.sameSite)) out.sameSite = c.sameSite;
+                const normSs = ssMap[String(c.sameSite || '').toLowerCase()];
+                if (normSs) out.sameSite = normSs;
                 return out;
               });
           }
@@ -573,13 +575,24 @@ jobs:
             } catch {}
           }
 
+          async function humanWander(page) {
+            try {
+              await page.mouse.move(180 + Math.random() * 140, 140 + Math.random() * 120, { steps: 12 });
+              await sleep(120 + Math.random() * 120);
+              await page.mouse.move(460 + Math.random() * 180, 290 + Math.random() * 110, { steps: 14 });
+              await sleep(100 + Math.random() * 120);
+            } catch {}
+          }
+
           async function humanClick(page, x, y) {
-            await page.mouse.move(x - 18 + Math.random() * 10, y - 12 + Math.random() * 8, { steps: 8 });
+            await page.bringToFront().catch(() => {});
+            await humanWander(page);
+            await page.mouse.move(x - 24 + Math.random() * 12, y - 16 + Math.random() * 10, { steps: 10 });
+            await sleep(90 + Math.random() * 90);
+            await page.mouse.move(x, y, { steps: 8 });
             await sleep(80 + Math.random() * 90);
-            await page.mouse.move(x, y, { steps: 6 });
-            await sleep(70 + Math.random() * 80);
             await page.mouse.down();
-            await sleep(60 + Math.random() * 60);
+            await sleep(70 + Math.random() * 70);
             await page.mouse.up();
           }
 
@@ -614,7 +627,7 @@ jobs:
                 await loc.waitFor({ state: 'visible', timeout: 15000 });
                 await loc.click({ timeout: 5000 });
                 await loc.fill('');
-                await loc.pressSequentially(text, { delay: 35 });
+                await loc.pressSequentially(text, { delay: 45 });
                 const val = await loc.inputValue();
                 if (val === text) {
                   console.log(label + ': OK len=' + val.length);
@@ -677,10 +690,10 @@ jobs:
                   const frameEl = await f.frameElement().catch(() => null);
                   if (frameEl) {
                     const box = await frameEl.boundingBox().catch(() => null);
-                    if (box && box.width > 0 && box.height > 0) {
-                      const cx = box.x + Math.min(28, box.width * 0.15);
+                    if (box && box.width > 100 && box.height > 30) {
+                      const cx = box.x + 28;
                       const cy = box.y + box.height / 2;
-                      console.log(`[turnstile] clicking iframe at (${Math.round(cx)}, ${Math.round(cy)})`);
+                      console.log(`[turnstile] clicking iframe (${Math.round(box.width)}x${Math.round(box.height)}) at (${Math.round(cx)}, ${Math.round(cy)})`);
                       await humanClick(page, cx, cy);
                       return true;
                     }
@@ -692,7 +705,7 @@ jobs:
                 if (!el) return null;
                 el.scrollIntoView({ block: 'center' });
                 const r = el.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) return { x: r.x + Math.min(28, r.width * 0.15), y: r.y + r.height / 2 };
+                if (r.width > 100 && r.height > 30) return { x: r.x + 28, y: r.y + r.height / 2 };
                 return null;
               }).catch(() => null);
               if (pos) {
@@ -746,11 +759,12 @@ jobs:
           }
 
           async function solveTurnstile(page, timeoutMs) {
-            timeoutMs = timeoutMs || 60000;
+            timeoutMs = timeoutMs || 90000;
             const cfOk = await waitForCloudflare(page, timeoutMs);
             if (!cfOk) return false;
             const start = Date.now();
             const end = start + timeoutMs;
+            let lastClickAt = 0;
             let clickCount = 0;
             console.log('[turnstile] checking widget token...');
             while (Date.now() < end) {
@@ -773,9 +787,12 @@ jobs:
                 return true;
               }
               const elapsed = Date.now() - start;
-              if ((clickCount === 0 && elapsed > 6000) || (clickCount === 1 && elapsed > 26000)) {
+              if (clickCount < 3 && elapsed > 4000 && Date.now() - lastClickAt > 24000) {
                 clickCount++;
+                lastClickAt = Date.now();
                 await clickTurnstileBox(page, st.verifyBtnPos);
+                await sleep(3000);
+                if (clickCount === 1) await shot(page, '02b_turnstile_clicked').catch(() => {});
               }
               await sleep(1000);
             }
@@ -978,7 +995,7 @@ jobs:
               await sleep(1000);
               if (attempt === 1) await shot(page, 'timer_01_loaded').catch(() => {});
 
-              await solveTurnstile(page, 45000);
+              await solveTurnstile(page, 60000);
               await sleep(1000);
               if (attempt === 1) await shot(page, 'timer_02_turnstile').catch(() => {});
 
@@ -1119,11 +1136,13 @@ jobs:
             headless: false,
             viewport: { width: 1280, height: 800 },
             args: [
-              '--no-sandbox',
-              '--disable-setuid-sandbox',
               '--disable-dev-shm-usage',
+              '--window-position=0,0',
               '--window-size=1280,800',
               '--autoplay-policy=no-user-gesture-required',
+              '--use-gl=angle',
+              '--use-angle=swiftshader',
+              '--enable-webgl',
             ],
           };
           if (process.env.BROWSER_PROXY) {
@@ -1200,13 +1219,14 @@ jobs:
               await sleep(1000);
               await shot(page, '01_login');
 
+              await humanWander(page);
               const emailOk = await safeType(page, 'input[name="email"], input#email, input[name="email-address"], input[type="email"], input[id="email-address"]', EMAIL, 'email');
               const passOk = await safeType(page, 'input[name="password"], input#password, input[type="password"], input[id="password"]', PASSWORD, 'password');
               await sleep(500);
               await shot(page, '02_creds');
               if (!emailOk || !passOk) throw new Error('登录表单填写失败: email=' + emailOk + ' password=' + passOk);
 
-              const tOk = await solveTurnstile(page, 60000);
+              const tOk = await solveTurnstile(page, 90000);
               console.log(tOk ? 'login turnstile ok' : 'login turnstile unconfirmed');
               await shot(page, '03_turnstile');
 
