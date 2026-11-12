@@ -56,20 +56,357 @@ jobs:
           sudo ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome-stable
           google-chrome-stable --version
 
-      - name: Enable WARP
-        uses: fscarmen/warp-on-actions@v1.3
+      - name: Cache Mihomo
+        id: cache-mihomo
+        if: env.HAS_PROXY == 'true'
+        env:
+          HAS_PROXY: ${{ secrets.PROXY_URL != '' }}
+        uses: actions/cache@v5
         with:
-          stack: dual
-          mode: client
+          path: /tmp/mihomo-bin
+          key: mihomo-v1
 
-      - name: Fix DNS
+      - name: Setup Multi-Protocol Proxy
+        if: env.PROXY_URL != ''
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sudo systemctl stop systemd-resolved 2>/dev/null || true
-          sudo systemctl disable systemd-resolved 2>/dev/null || true
-          sudo rm -f /etc/resolv.conf
-          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
-          echo "Exit IP: $(curl -s --max-time 15 https://api.ipify.org || echo 'unreachable')"
-          curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || echo "WARP trace unavailable"
+          mkdir -p /tmp/mihomo-bin /tmp/mihomo
+          if [ ! -x /tmp/mihomo-bin/mihomo ]; then
+            echo "Downloading mihomo..."
+            DL_URL=$(python3 - << 'PYEOF'
+          import urllib.request, json, re, os
+          req = urllib.request.Request('https://api.github.com/repos/MetaCubeX/mihomo/releases/latest')
+          tok = os.environ.get('GITHUB_TOKEN')
+          if tok:
+              req.add_header('Authorization', f'Bearer {tok}')
+          try:
+              data = json.loads(urllib.request.urlopen(req, timeout=15).read())
+              for pat in [r'^mihomo-linux-amd64-compatible-v[\d.]+\.gz$', r'^mihomo-linux-amd64-v[\d.]+\.gz$']:
+                  for a in data.get('assets', []):
+                      if re.match(pat, a['name']):
+                          print(a['browser_download_url'])
+                          raise SystemExit(0)
+          except Exception:
+              pass
+          print('https://github.com/MetaCubeX/mihomo/releases/download/v1.19.16/mihomo-linux-amd64-compatible-v1.19.16.gz')
+          PYEOF
+            )
+            curl -fsSL "$DL_URL" | gunzip > /tmp/mihomo-bin/mihomo
+            chmod +x /tmp/mihomo-bin/mihomo
+          fi
+
+          python3 - << 'PYEOF'
+          import os, re, json, base64, urllib.request
+          from urllib.parse import urlparse, parse_qs, unquote
+
+          raw_input = os.environ.get('PROXY_URL', '').strip()
+          if not raw_input:
+              raise SystemExit(0)
+
+          def b64dec(s):
+              s = s.strip().replace('-', '+').replace('_', '/')
+              pad = len(s) % 4
+              if pad:
+                  s += '=' * (4 - pad)
+              return base64.b64decode(s).decode('utf-8', errors='ignore')
+
+          used_names = set()
+          def unique_name(base):
+              base = re.sub(r'[\r\n\t]+', ' ', (base or 'node')).strip()[:40] or 'node'
+              name = base
+              idx = 2
+              while name in used_names:
+                  name = f"{base}_{idx}"
+                  idx += 1
+              used_names.add(name)
+              return name
+
+          def parse_uri(uri):
+              uri = uri.strip()
+              if not uri:
+                  return None
+              try:
+                  if uri.startswith('vmess://'):
+                      d = json.loads(b64dec(uri[8:]))
+                      net = d.get('net', 'tcp')
+                      tls = str(d.get('tls', '')).lower() in ('tls', '1', 'true')
+                      p = {
+                          'name': unique_name(d.get('ps', 'vmess')),
+                          'type': 'vmess',
+                          'server': d['add'],
+                          'port': int(d['port']),
+                          'uuid': d['id'],
+                          'alterId': int(d.get('aid', 0)),
+                          'cipher': d.get('scy') or d.get('security') or 'auto',
+                          'udp': True,
+                          'tls': tls,
+                          'skip-cert-verify': True,
+                          'network': net,
+                          'client-fingerprint': d.get('fp') or 'chrome',
+                      }
+                      if d.get('sni') or d.get('host'):
+                          p['servername'] = d.get('sni') or d.get('host')
+                      if net == 'ws':
+                          ws = {'path': d.get('path') or '/'}
+                          if d.get('host'):
+                              ws['headers'] = {'Host': d['host']}
+                          p['ws-opts'] = ws
+                      elif net == 'grpc':
+                          p['grpc-opts'] = {'grpc-service-name': d.get('path') or ''}
+                      return p
+
+                  u = urlparse(uri)
+                  scheme = u.scheme.lower()
+                  q = {k: v[0] for k, v in parse_qs(u.query).items()}
+                  tag = unquote(u.fragment) if u.fragment else scheme
+                  host = u.hostname
+                  port = u.port
+                  if not host or not port:
+                      return None
+
+                  if scheme == 'vless':
+                      sec = q.get('security', 'none').lower()
+                      net = q.get('type', 'tcp').lower()
+                      p = {
+                          'name': unique_name(tag),
+                          'type': 'vless',
+                          'server': host,
+                          'port': int(port),
+                          'uuid': unquote(u.username or ''),
+                          'udp': True,
+                          'tls': sec in ('tls', 'reality'),
+                          'skip-cert-verify': q.get('allowInsecure') in ('1', 'true') or q.get('insecure') in ('1', 'true'),
+                          'network': net,
+                          'client-fingerprint': q.get('fp') or 'chrome',
+                      }
+                      if q.get('sni') or q.get('peer'):
+                          p['servername'] = q.get('sni') or q.get('peer')
+                      if q.get('flow'):
+                          p['flow'] = q['flow']
+                      if q.get('alpn'):
+                          p['alpn'] = [x.strip() for x in q['alpn'].split(',') if x.strip()]
+                      if sec == 'reality':
+                          p['reality-opts'] = {
+                              'public-key': q.get('pbk', ''),
+                              'short-id': q.get('sid', ''),
+                          }
+                      if net == 'ws':
+                          ws = {'path': q.get('path') or '/'}
+                          if q.get('host'):
+                              ws['headers'] = {'Host': q['host']}
+                          p['ws-opts'] = ws
+                      elif net == 'grpc':
+                          p['grpc-opts'] = {'grpc-service-name': q.get('serviceName', '')}
+                      return p
+
+                  if scheme == 'trojan':
+                      net = q.get('type', 'tcp').lower()
+                      p = {
+                          'name': unique_name(tag),
+                          'type': 'trojan',
+                          'server': host,
+                          'port': int(port),
+                          'password': unquote(u.username or ''),
+                          'udp': True,
+                          'sni': q.get('sni') or q.get('peer') or host,
+                          'skip-cert-verify': q.get('allowInsecure') in ('1', 'true') or q.get('insecure') in ('1', 'true'),
+                          'client-fingerprint': q.get('fp') or 'chrome',
+                          'network': net,
+                      }
+                      if net == 'ws':
+                          ws = {'path': q.get('path') or '/'}
+                          if q.get('host'):
+                              ws['headers'] = {'Host': q['host']}
+                          p['ws-opts'] = ws
+                      elif net == 'grpc':
+                          p['grpc-opts'] = {'grpc-service-name': q.get('serviceName', '')}
+                      return p
+
+                  if scheme in ('hysteria2', 'hy2'):
+                      pw = unquote(u.username or '')
+                      if u.password:
+                          pw = f"{pw}:{unquote(u.password)}"
+                      p = {
+                          'name': unique_name(tag),
+                          'type': 'hysteria2',
+                          'server': host,
+                          'port': int(port),
+                          'password': pw,
+                          'skip-cert-verify': q.get('insecure') in ('1', 'true') or q.get('allowInsecure') in ('1', 'true'),
+                          'alpn': [x.strip() for x in q.get('alpn', 'h3').split(',') if x.strip()],
+                      }
+                      if q.get('sni') or q.get('peer'):
+                          p['sni'] = q.get('sni') or q.get('peer')
+                      if q.get('obfs') and q.get('obfs') != 'none':
+                          p['obfs'] = q['obfs']
+                          p['obfs-password'] = q.get('obfs-password', '')
+                      return p
+
+                  if scheme == 'tuic':
+                      p = {
+                          'name': unique_name(tag),
+                          'type': 'tuic',
+                          'server': host,
+                          'port': int(port),
+                          'uuid': unquote(u.username or ''),
+                          'password': unquote(u.password or ''),
+                          'congestion-controller': q.get('congestion_control', 'bbr'),
+                          'udp-relay-mode': q.get('udp_relay_mode', 'native'),
+                          'alpn': [x.strip() for x in q.get('alpn', 'h3').split(',') if x.strip()],
+                          'skip-cert-verify': q.get('allow_insecure') in ('1', 'true') or q.get('insecure') in ('1', 'true'),
+                      }
+                      if q.get('sni'):
+                          p['sni'] = q['sni']
+                      return p
+
+                  if scheme == 'anytls':
+                      sec = q.get('security', 'tls').lower()
+                      p = {
+                          'name': unique_name(tag),
+                          'type': 'anytls',
+                          'server': host,
+                          'port': int(port),
+                          'password': unquote(u.username or ''),
+                          'client-fingerprint': q.get('fp') or 'chrome',
+                          'skip-cert-verify': q.get('insecure') in ('1', 'true') or q.get('allowInsecure') in ('1', 'true'),
+                      }
+                      if q.get('sni'):
+                          p['sni'] = q['sni']
+                      if sec == 'reality':
+                          p['reality-opts'] = {
+                              'public-key': q.get('pbk', ''),
+                              'short-id': q.get('sid', ''),
+                          }
+                      return p
+
+                  if scheme == 'ss':
+                      raw_ss = uri[5:].split('#')[0]
+                      if '@' in raw_ss:
+                          userinfo, serverpart = raw_ss.split('@', 1)
+                          if ':' not in userinfo:
+                              userinfo = b64dec(userinfo)
+                      else:
+                          decoded = b64dec(raw_ss)
+                          userinfo, serverpart = decoded.rsplit('@', 1)
+                      method, pw = userinfo.split(':', 1)
+                      h, pt = serverpart.split('?')[0].rsplit(':', 1)
+                      return {
+                          'name': unique_name(tag),
+                          'type': 'ss',
+                          'server': h.strip('[]'),
+                          'port': int(pt),
+                          'cipher': method,
+                          'password': pw,
+                          'udp': True,
+                      }
+
+                  if scheme in ('socks', 'socks5', 'http', 'https'):
+                      ptype = 'http' if scheme in ('http', 'https') else 'socks5'
+                      p = {
+                          'name': unique_name(tag),
+                          'type': ptype,
+                          'server': host,
+                          'port': int(port),
+                      }
+                      if u.username and not u.password:
+                          try:
+                              dec_auth = b64dec(unquote(u.username))
+                              if ':' in dec_auth:
+                                  p['username'], p['password'] = dec_auth.split(':', 1)
+                              else:
+                                  p['username'] = unquote(u.username)
+                          except Exception:
+                              p['username'] = unquote(u.username)
+                      elif u.username:
+                          p['username'] = unquote(u.username)
+                          if u.password:
+                              p['password'] = unquote(u.password)
+                      return p
+              except Exception as e:
+                  print(f"Skip invalid URI ({uri[:20]}...): {e}")
+              return None
+
+          proxies = []
+          lines = [x.strip() for x in re.split(r'[\r\n]+', raw_input) if x.strip()]
+
+          # 判断是否为订阅链接
+          if len(lines) == 1 and re.match(r'^https?://', lines[0]) and '@' not in lines[0]:
+              print("Fetching subscription URL...")
+              req = urllib.request.Request(lines[0], headers={'User-Agent': 'clash-verge/v2.0.0'})
+              body = urllib.request.urlopen(req, timeout=20).read().decode('utf-8', errors='ignore').strip()
+              if 'proxies:' in body:
+                  import subprocess, sys
+                  subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'pyyaml'], check=True)
+                  import yaml
+                  sub_cfg = yaml.safe_load(body)
+                  for item in (sub_cfg or {}).get('proxies', []):
+                      nm = item.get('name', '')
+                      if any(k in nm for k in ['剩余', '到期', '套餐', '官网', 'Traffic', 'Expire']):
+                          continue
+                      item['name'] = unique_name(nm)
+                      proxies.append(item)
+              else:
+                  try:
+                      decoded_sub = b64dec(body)
+                      if '://' in decoded_sub:
+                          body = decoded_sub
+                  except Exception:
+                      pass
+                  for line in re.split(r'[\r\n]+', body):
+                      p = parse_uri(line)
+                      if p:
+                          proxies.append(p)
+          else:
+              for line in lines:
+                  p = parse_uri(line)
+                  if p:
+                      proxies.append(p)
+
+          if not proxies:
+              raise SystemExit("ERROR: PROXY_URL 未能解析出任何有效节点！")
+
+          proxy_names = [p['name'] for p in proxies]
+          config = {
+              'mixed-port': 10808,
+              'allow-lan': False,
+              'mode': 'rule',
+              'log-level': 'warning',
+              'ipv6': True,
+              'dns': {
+                  'enable': True,
+                  'enhanced-mode': 'fake-ip',
+                  'nameserver': ['1.1.1.1', '8.8.8.8'],
+              },
+              'proxies': proxies,
+              'proxy-groups': [
+                  {
+                      'name': 'AUTO',
+                      'type': 'url-test',
+                      'proxies': proxy_names,
+                      'url': 'https://www.gstatic.com/generate_204',
+                      'interval': 300,
+                  }
+              ],
+              'rules': ['MATCH,AUTO'],
+          }
+
+          with open('/tmp/mihomo/config.json', 'w', encoding='utf-8') as f:
+              json.dump(config, f, ensure_ascii=False, indent=2)
+          print(f"Successfully loaded {len(proxies)} proxy node(s): {', '.join(proxy_names[:5])}")
+          PYEOF
+
+          nohup /tmp/mihomo-bin/mihomo -d /tmp/mihomo -f /tmp/mihomo/config.json >/tmp/mihomo/mihomo.log 2>&1 &
+          sleep 3
+          EXIT_IP=$(curl -s --max-time 15 -x socks5h://127.0.0.1:10808 https://api.ipify.org || true)
+          if [ -z "$EXIT_IP" ]; then
+            cat /tmp/mihomo/mihomo.log || true
+            echo "Proxy connectivity check failed!"
+            exit 1
+          fi
+          echo "Proxy connected! Browser Exit IP: $EXIT_IP"
+          echo "BROWSER_PROXY=socks5://127.0.0.1:10808" >> $GITHUB_ENV
 
       - name: Cache node_modules
         id: cache-npm
@@ -835,9 +1172,22 @@ jobs:
             return await getStatus(page).catch(()=> 'unknown');
           }
 
+          const chromeArgs = [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--window-size=1280,800',
+            '--autoplay-policy=no-user-gesture-required'
+          ];
+          if (process.env.BROWSER_PROXY) {
+            chromeArgs.push(`--proxy-server=${process.env.BROWSER_PROXY}`);
+            console.log('Chrome using proxy: ' + process.env.BROWSER_PROXY);
+          }
+
           const { browser, page } = await connect({
             headless: false, turnstile: true, disableXvfb: false,
-            args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1280,800','--autoplay-policy=no-user-gesture-required'],
+            args: chromeArgs,
             customConfig: { chromePath: '/usr/bin/google-chrome-stable' },
             connectOption: { defaultViewport: { width:1280, height:800 }, protocolTimeout: 300000 },
           });
