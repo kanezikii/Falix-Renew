@@ -493,26 +493,43 @@ jobs:
             console.log(`${label}: ${Math.round(elapsed/1000)}s`);
           }
 
-          async function loadCookies(page) {
+          function sanitizeCookies(rawList) {
+            return rawList
+              .filter(c => c && typeof c === 'object' && c.name && c.value !== undefined)
+              .map(c => {
+                const out = {
+                  name: String(c.name),
+                  value: String(c.value),
+                };
+                if (c.url) out.url = String(c.url);
+                if (c.domain) out.domain = String(c.domain);
+                if (c.path) out.path = String(c.path);
+                if (typeof c.expires === 'number' && c.expires > 0) out.expires = c.expires;
+                else if (typeof c.expirationDate === 'number' && c.expirationDate > 0) out.expires = c.expirationDate;
+                if (typeof c.httpOnly === 'boolean') out.httpOnly = c.httpOnly;
+                if (typeof c.secure === 'boolean') out.secure = c.secure;
+                if (['Strict', 'Lax', 'None'].includes(c.sameSite)) out.sameSite = c.sameSite;
+                return out;
+              });
+          }
+
+          async function loadCookies(page, forceSecret = false) {
             if (!COOKIES_PATH) return false;
             try {
-              if (!fs.existsSync(COOKIES_PATH) && process.env.FALIX_COOKIES) {
+              if (forceSecret) {
+                if (!process.env.FALIX_COOKIES) return false;
+                fs.writeFileSync(COOKIES_PATH, process.env.FALIX_COOKIES.trim());
+                console.log('已使用 FALIX_COOKIES Secret 覆盖本地缓存');
+              } else if (!fs.existsSync(COOKIES_PATH) && process.env.FALIX_COOKIES) {
                 fs.writeFileSync(COOKIES_PATH, process.env.FALIX_COOKIES.trim());
                 console.log('已从 FALIX_COOKIES Secret 初始化 cookie 文件');
               }
               if (!fs.existsSync(COOKIES_PATH)) return false;
               const data = fs.readFileSync(COOKIES_PATH, 'utf8');
               const cookies = JSON.parse(data);
-              if (!cookies || cookies.length === 0) return false;
-              const cleanCookies = cookies.map(c => {
-                const copy = { ...c };
-                if (!['Strict', 'Lax', 'None'].includes(copy.sameSite)) {
-                  delete copy.sameSite;
-                }
-                delete copy.storeId;
-                delete copy.id;
-                return copy;
-              });
+              if (!Array.isArray(cookies) || cookies.length === 0) return false;
+              const cleanCookies = sanitizeCookies(cookies);
+              if (cleanCookies.length === 0) return false;
               await page.setCookie(...cleanCookies);
               console.log('已加载 ' + cleanCookies.length + ' 个 cookie');
               return true;
@@ -774,7 +791,7 @@ jobs:
                   if (frameEl) {
                     const box = await frameEl.boundingBox().catch(() => null);
                     if (box && box.width > 0 && box.height > 0) {
-                      const cx = box.x + Math.min(30, box.width * 0.15);
+                      const cx = box.x + Math.min(28, box.width * 0.15);
                       const cy = box.y + box.height / 2;
                       console.log(`[turnstile] manual cdpClick at (${Math.round(cx)}, ${Math.round(cy)})`);
                       await cdpClick(page, cx, cy);
@@ -786,8 +803,9 @@ jobs:
               const pos = await page.evaluate(() => {
                 const el = document.querySelector('.cf-turnstile, [data-sitekey], iframe[src*="challenges.cloudflare.com"]');
                 if (!el) return null;
+                el.scrollIntoView({ block: 'center' });
                 const r = el.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) return { x: r.x + Math.min(30, r.width * 0.15), y: r.y + r.height / 2 };
+                if (r.width > 0 && r.height > 0) return { x: r.x + Math.min(28, r.width * 0.15), y: r.y + r.height / 2 };
                 return null;
               }).catch(() => null);
               if (pos) {
@@ -811,7 +829,6 @@ jobs:
             while (Date.now() < end) {
               const st = await getChallengeState(page);
               if (!st.isInterstitial) {
-                // 二次复核，防止页面重定向瞬间空 DOM 导致的假放行
                 await sleep(2000);
                 const st2 = await getChallengeState(page);
                 if (!st2.isInterstitial) {
@@ -841,7 +858,7 @@ jobs:
             await waitForCloudflare(page, timeoutMs);
             const start = Date.now();
             const end = start + timeoutMs;
-            let lastManualClick = 0;
+            let clickCount = 0;
             console.log('[turnstile] checking widget token...');
             while (Date.now() < end) {
               const st = await getChallengeState(page);
@@ -863,8 +880,8 @@ jobs:
                 return true;
               }
               const elapsed = Date.now() - start;
-              if (elapsed > 12000 && Date.now() - lastManualClick > 15000) {
-                lastManualClick = Date.now();
+              if ((clickCount === 0 && elapsed > 8000) || (clickCount === 1 && elapsed > 32000)) {
+                clickCount++;
                 await clickTurnstileBox(page);
               }
               await sleep(1000);
@@ -1247,7 +1264,7 @@ jobs:
           try {
             let loggedIn = false;
 
-            const cookieLoaded = await loadCookies(page);
+            const cookieLoaded = await loadCookies(page, false);
             if (cookieLoaded) {
               await page.goto(SERVER_URL, { waitUntil:'domcontentloaded', timeout:30000 }).catch(()=>{});
               await sleep(2000);
@@ -1258,7 +1275,21 @@ jobs:
                 loggedIn = true;
                 await saveCookies(page);
               } else {
-                console.log('cookie 已过期，需要重新登录');
+                console.log('缓存 cookie 已过期，尝试回退到 FALIX_COOKIES Secret...');
+                const secretLoaded = await loadCookies(page, true);
+                if (secretLoaded) {
+                  await page.goto(SERVER_URL, { waitUntil:'domcontentloaded', timeout:30000 }).catch(()=>{});
+                  await sleep(2000);
+                  await waitForCloudflare(page, 120000);
+                  const url2 = page.url();
+                  if (url2.includes('/server/') && !url2.includes('/auth/login')) {
+                    console.log('FALIX_COOKIES Secret 有效，直接进入控制台');
+                    loggedIn = true;
+                    await saveCookies(page);
+                  } else {
+                    console.log('Secret cookie 也已过期，需要重新登录');
+                  }
+                }
               }
             }
 
