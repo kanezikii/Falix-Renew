@@ -131,12 +131,25 @@ jobs:
           async function loadCookies(page) {
             if (!COOKIES_PATH) return false;
             try {
+              if (!fs.existsSync(COOKIES_PATH) && process.env.FALIX_COOKIES) {
+                fs.writeFileSync(COOKIES_PATH, process.env.FALIX_COOKIES.trim());
+                console.log('已从 FALIX_COOKIES Secret 初始化 cookie 文件');
+              }
               if (!fs.existsSync(COOKIES_PATH)) return false;
               const data = fs.readFileSync(COOKIES_PATH, 'utf8');
               const cookies = JSON.parse(data);
               if (!cookies || cookies.length === 0) return false;
-              await page.setCookie(...cookies);
-              console.log('已加载 ' + cookies.length + ' 个 cookie');
+              const cleanCookies = cookies.map(c => {
+                const copy = { ...c };
+                if (!['Strict', 'Lax', 'None'].includes(copy.sameSite)) {
+                  delete copy.sameSite;
+                }
+                delete copy.storeId;
+                delete copy.id;
+                return copy;
+              });
+              await page.setCookie(...cleanCookies);
+              console.log('已加载 ' + cleanCookies.length + ' 个 cookie');
               return true;
             } catch(e) {
               console.log('加载 cookie 失败: ' + e.message);
@@ -371,10 +384,48 @@ jobs:
             }).catch(()=>false);
           }
 
+          async function clickTurnstileBox(page) {
+            try {
+              const frames = page.frames();
+              for (const f of frames) {
+                if (f.url().includes('challenges.cloudflare.com')) {
+                  const frameEl = await f.frameElement().catch(() => null);
+                  if (frameEl) {
+                    const box = await frameEl.boundingBox().catch(() => null);
+                    if (box && box.width > 0 && box.height > 0) {
+                      const cx = box.x + Math.min(30, box.width * 0.15);
+                      const cy = box.y + box.height / 2;
+                      console.log(`[turnstile] manual cdpClick at (${Math.round(cx)}, ${Math.round(cy)})`);
+                      await cdpClick(page, cx, cy);
+                      return true;
+                    }
+                  }
+                }
+              }
+              const pos = await page.evaluate(() => {
+                const el = document.querySelector('.cf-turnstile, [data-sitekey], iframe[src*="challenges.cloudflare.com"]');
+                if (!el) return null;
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) return { x: r.x + Math.min(30, r.width * 0.15), y: r.y + r.height / 2 };
+                return null;
+              }).catch(() => null);
+              if (pos) {
+                console.log(`[turnstile] fallback cdpClick at (${Math.round(pos.x)}, ${Math.round(pos.y)})`);
+                await cdpClick(page, pos.x, pos.y);
+                return true;
+              }
+            } catch (e) {
+              console.log('[turnstile] click err: ' + e.message);
+            }
+            return false;
+          }
+
           async function solveTurnstile(page, timeoutMs) {
-            timeoutMs = timeoutMs || 30000;
-            const end = Date.now() + timeoutMs;
-            console.log('[turnstile] waiting for auto-solve...');
+            timeoutMs = timeoutMs || 45000;
+            const start = Date.now();
+            const end = start + timeoutMs;
+            let lastManualClick = 0;
+            console.log('[turnstile] waiting for solve (' + Math.round(timeoutMs / 1000) + 's)...');
             while (Date.now() < end) {
               if (await hasTurnstileToken(page)) {
                 const token = await page.evaluate(() => {
@@ -383,6 +434,11 @@ jobs:
                 });
                 console.log('[turnstile] solved, token len=' + (token ? token.length : 0));
                 return true;
+              }
+              const elapsed = Date.now() - start;
+              if (elapsed > 10000 && Date.now() - lastManualClick > 6000) {
+                lastManualClick = Date.now();
+                await clickTurnstileBox(page);
               }
               await sleep(1000);
             }
@@ -772,7 +828,7 @@ jobs:
               await shot(page, '02_creds');
               if (!emailOk || !passOk) throw new Error('登录表单填写失败: email=' + emailOk + ' password=' + passOk);
 
-              const tOk = await solveTurnstile(page, 15000);
+              const tOk = await solveTurnstile(page, 45000);
               console.log(tOk ? 'login turnstile ok' : 'login turnstile unconfirmed');
               await shot(page, '03_turnstile');
 
@@ -882,6 +938,7 @@ jobs:
           FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
           FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
           FALIX_SERVER_ID: ${{ secrets.FALIX_SERVER_ID }}
+          FALIX_COOKIES: ${{ secrets.FALIX_COOKIES }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           COOKIES_PATH: ${{ github.workspace }}/cookies.json
