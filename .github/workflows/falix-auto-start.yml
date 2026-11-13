@@ -17,6 +17,11 @@ jobs:
     permissions:
       contents: read
       actions: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        account: [1, 2]
 
     steps:
       - name: Checkout
@@ -52,6 +57,7 @@ jobs:
         if: steps.cache-chrome.outputs.cache-hit == 'true'
         run: |
           sudo mkdir -p /opt/google/chrome
+          sudo cp -a /tmp/chrome-cache/. /tmp/chrome-cache-tmp 2>/dev/null || true
           sudo cp -a /tmp/chrome-cache/. /opt/google/chrome/
           sudo ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome
           sudo ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome-stable
@@ -453,8 +459,10 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: cookies.json
-          key: falix-cookies-${{ github.run_id }}
-          restore-keys: falix-cookies-
+          key: falix-cookies-${{ matrix.account }}-${{ github.run_id }}
+          restore-keys: |
+            falix-cookies-${{ matrix.account }}-
+            ${{ matrix.account == 1 && 'falix-cookies-' || 'falix-cookies-none-' }}
 
       - name: Write script
         run: |
@@ -475,10 +483,14 @@ jobs:
             fatalCdp = msg;
           });
 
-          const EMAIL      = process.env.FALIX_EMAIL;
-          const PASSWORD   = process.env.FALIX_PASSWORD;
-          const SERVER_ID  = process.env.FALIX_SERVER_ID;
-          if (!SERVER_ID) { console.error('FALIX_SERVER_ID 未设置，请在 Settings→Secrets 配置'); process.exit(1); }
+          const IDX        = process.env.ACCOUNT_INDEX || '1';
+          const EMAIL      = IDX === '1' ? process.env.FALIX_EMAIL_1 : process.env.FALIX_EMAIL_2;
+          const PASSWORD   = IDX === '1' ? process.env.FALIX_PASSWORD_1 : process.env.FALIX_PASSWORD_2;
+          const SERVER_ID  = IDX === '1' ? process.env.FALIX_SERVER_ID_1 : (process.env.FALIX_SERVER_ID_2 || '3547959');
+          const RAW_SECRET_COOKIES = IDX === '1' ? process.env.FALIX_COOKIES_1 : process.env.FALIX_COOKIES_2;
+          const ACC_TAG    = `账号${IDX}(${SERVER_ID})`;
+
+          if (!SERVER_ID) { console.error(`[${ACC_TAG}] SERVER_ID 未设置，请在 Settings→Secrets 配置`); process.exit(1); }
           const TG_TOKEN   = process.env.TG_TOKEN;
           const TG_CHAT_ID = process.env.TG_CHAT_ID;
           const LOGIN_URL  = 'https://client.falixnodes.net/auth/login';
@@ -491,7 +503,7 @@ jobs:
 
           async function checkTime(label) {
             const elapsed = Date.now() - START;
-            console.log(`${label}: ${Math.round(elapsed/1000)}s`);
+            console.log(`[${ACC_TAG}] ${label}: ${Math.round(elapsed/1000)}s`);
           }
 
           function sanitizeCookies(rawList, stripCf = false) {
@@ -522,14 +534,14 @@ jobs:
             try {
               let fromSecret = false;
               if (forceSecret) {
-                if (!process.env.FALIX_COOKIES) return false;
-                fs.writeFileSync(COOKIES_PATH, process.env.FALIX_COOKIES.trim());
+                if (!RAW_SECRET_COOKIES) return false;
+                fs.writeFileSync(COOKIES_PATH, RAW_SECRET_COOKIES.trim());
                 fromSecret = true;
-                console.log('已使用 FALIX_COOKIES Secret 覆盖本地缓存');
-              } else if (!fs.existsSync(COOKIES_PATH) && process.env.FALIX_COOKIES) {
-                fs.writeFileSync(COOKIES_PATH, process.env.FALIX_COOKIES.trim());
+                console.log(`[${ACC_TAG}] 已使用 Secret 覆盖本地缓存`);
+              } else if (!fs.existsSync(COOKIES_PATH) && RAW_SECRET_COOKIES) {
+                fs.writeFileSync(COOKIES_PATH, RAW_SECRET_COOKIES.trim());
                 fromSecret = true;
-                console.log('已从 FALIX_COOKIES Secret 初始化 cookie 文件');
+                console.log(`[${ACC_TAG}] 已从 Secret 初始化 cookie 文件`);
               }
               if (!fs.existsSync(COOKIES_PATH)) return false;
               const data = fs.readFileSync(COOKIES_PATH, 'utf8');
@@ -538,10 +550,10 @@ jobs:
               const cleanCookies = sanitizeCookies(cookies, fromSecret);
               if (cleanCookies.length === 0) return false;
               await context.addCookies(cleanCookies);
-              console.log('已加载 ' + cleanCookies.length + ' 个 cookie');
+              console.log(`[${ACC_TAG}] 已加载 ` + cleanCookies.length + ' 个 cookie');
               return true;
             } catch(e) {
-              console.log('加载 cookie 失败: ' + e.message);
+              console.log(`[${ACC_TAG}] 加载 cookie 失败: ` + e.message);
               return false;
             }
           }
@@ -551,9 +563,9 @@ jobs:
             try {
               const cookies = await context.cookies();
               fs.writeFileSync(COOKIES_PATH, JSON.stringify(cookies, null, 2));
-              console.log('已保存 ' + cookies.length + ' 个 cookie');
+              console.log(`[${ACC_TAG}] 已保存 ` + cookies.length + ' 个 cookie');
             } catch(e) {
-              console.log('保存 cookie 失败: ' + e.message);
+              console.log(`[${ACC_TAG}] 保存 cookie 失败: ` + e.message);
             }
           }
           fs.mkdirSync('/tmp/ss', { recursive: true });
@@ -976,7 +988,7 @@ jobs:
           }
 
           async function doExtend(page) {
-            console.log('=== TIMER EXTEND ===');
+            console.log(`=== [${ACC_TAG}] TIMER EXTEND ===`);
             const CAP = 168 * 3600;
             let lastKnown = -1;
             let totalGain = 0;
@@ -1148,12 +1160,12 @@ jobs:
           if (process.env.BROWSER_PROXY) {
             launchOpts.proxy = { server: process.env.BROWSER_PROXY };
             launchOpts.args.push('--force-webrtc-ip-handling-policy=disable_non_proxied_udp');
-            console.log('Patchright (Chrome) using proxy: ' + process.env.BROWSER_PROXY);
+            console.log(`[${ACC_TAG}] Patchright (Chrome) using proxy: ` + process.env.BROWSER_PROXY);
           }
 
           const context = await chromium.launchPersistentContext('/tmp/chrome-profile', launchOpts);
           const page = context.pages()[0] || await context.newPage();
-          console.log('patchright chrome ok');
+          console.log(`[${ACC_TAG}] patchright chrome ok`);
 
           page.on('response', async res => {
             try {
@@ -1189,11 +1201,11 @@ jobs:
               }
               const url = page.url();
               if (url.includes('/server/') && !url.includes('/auth/login')) {
-                console.log('cookie 有效，直接进入控制台');
+                console.log(`[${ACC_TAG}] cookie 有效，直接进入控制台`);
                 loggedIn = true;
                 await saveCookies(context);
               } else {
-                console.log('缓存 cookie 已过期，尝试回退到 FALIX_COOKIES Secret...');
+                console.log(`[${ACC_TAG}] 缓存 cookie 已过期，尝试回退到 Secret...`);
                 const secretLoaded = await loadCookies(context, true);
                 if (secretLoaded) {
                   await page.goto(SERVER_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
@@ -1202,11 +1214,11 @@ jobs:
                   if (!cfOk2) throw new Error('ProtocolError: Cloudflare challenge timeout on secret cookie');
                   const url2 = page.url();
                   if (url2.includes('/server/') && !url2.includes('/auth/login')) {
-                    console.log('FALIX_COOKIES Secret 有效，直接进入控制台');
+                    console.log(`[${ACC_TAG}] Secret cookie 有效，直接进入控制台`);
                     loggedIn = true;
                     await saveCookies(context);
                   } else {
-                    console.log('Secret cookie 也已过期，需要重新登录');
+                    console.log(`[${ACC_TAG}] Secret cookie 也已过期，需要重新登录`);
                   }
                 }
               }
@@ -1239,17 +1251,17 @@ jobs:
 
               if (page.url().includes('/auth/2fa')) {
                 console.log('login requires 2FA: ' + page.url());
-                await tg('❌ <b>Falix</b> 登录需要 2FA，脚本无法自动完成');
+                await tg(`❌ <b>Falix [${ACC_TAG}]</b> 登录需要 2FA，脚本无法自动完成`);
                 throw new Error('账号启用了 2FA（' + page.url() + '），请关闭 2FA 或改用 cookie');
               }
 
               if (page.url().includes('/auth/login')) {
                 const err = await page.evaluate(() => [...document.querySelectorAll('.invalid-feedback,.alert,.error,[role="alert"]')].map(e => e.textContent?.trim()).filter(Boolean).join('|')).catch(() => '');
                 console.log('login failed: ' + err);
-                await tg('❌ <b>Falix</b> 登录失败: ' + err);
+                await tg(`❌ <b>Falix [${ACC_TAG}]</b> 登录失败: ` + err);
                 process.exit(1);
               }
-              console.log('login ok');
+              console.log(`[${ACC_TAG}] login ok`);
               await saveCookies(context);
               try { fs.writeFileSync('fresh-login.flag', String(Date.now())); } catch {}
               await checkTime('login');
@@ -1265,19 +1277,19 @@ jobs:
             await dumpUi(page, 'console');
 
             const st = await getStatus(page);
-            console.log('status: ' + st);
+            console.log(`[${ACC_TAG}] status: ` + st);
             await checkTime('status');
 
             if (st === 'starting' || st === 'online') {
-              await tg('✅ <b>Falix</b> 状态 <code>' + st + '</code>，无需操作');
+              await tg(`✅ <b>Falix [${ACC_TAG}]</b> 状态 <code>` + st + '</code>，无需操作');
               console.log('already running');
             } else {
               const final = await doStart(page);
               if (final === 'starting' || final === 'online') {
-                await tg('✅ <b>Falix</b> 启动成功，状态: <code>' + final + '</code>');
+                await tg(`✅ <b>Falix [${ACC_TAG}]</b> 启动成功，状态: <code>` + final + '</code>');
                 console.log('start success');
               } else {
-                await tg('⚠️ <b>Falix</b> 三次后仍为 <code>' + final + '</code>');
+                await tg(`⚠️ <b>Falix [${ACC_TAG}]</b> 三次后仍为 <code>` + final + '</code>');
                 console.log('still: ' + final);
               }
             }
@@ -1301,29 +1313,29 @@ jobs:
             const CAP = 168 * 3600;
             if (timeAfter > timeBefore && timeBefore > 0 && timeAfter > 0) {
               const gain = timeAfter - timeBefore;
-              await tg('✅ <b>Falix</b> 计时器已续期: ' + fmt(timeBefore) + '(' + timeBefore + 's) → ' + fmt(timeAfter) + '(' + timeAfter + 's) +' + gain + 's');
+              await tg(`✅ <b>Falix [${ACC_TAG}]</b> 计时器已续期: ` + fmt(timeBefore) + '(' + timeBefore + 's) → ' + fmt(timeAfter) + '(' + timeAfter + 's) +' + gain + 's');
               console.log('timer extend success (verified gain=' + gain + ')');
             } else if (ext === 'capped' || timeAfter >= CAP - 3600) {
-              await tg('✅ <b>Falix</b> 计时器接近上限: ' + fmt(timeAfter) + '，无需续期');
+              await tg(`✅ <b>Falix [${ACC_TAG}]</b> 计时器接近上限: ` + fmt(timeAfter) + '，无需续期');
               console.log('timer already near cap (' + timeAfter + 's)');
             } else if (timeAfter > 0 && timeBefore === -1) {
-              await tg('✅ <b>Falix</b> 计时器读数: ' + fmt(timeAfter) + '（续期状态: ' + ext + '）');
+              await tg(`✅ <b>Falix [${ACC_TAG}]</b> 计时器读数: ` + fmt(timeAfter) + '（续期状态: ' + ext + '）');
               console.log('timer extend result (timeBefore unknown)');
             } else if (ext === 'ok') {
-              await tg('✅ <b>Falix</b> 计时器已续期（时间校验: ' + timeBefore + '→' + timeAfter + '）');
+              await tg(`✅ <b>Falix [${ACC_TAG}]</b> 计时器已续期（时间校验: ` + timeBefore + '→' + timeAfter + '）');
               console.log('timer extend success (unverified)');
             } else if (timeAfter === timeBefore && timeAfter > 0) {
-              await tg('⚠️ <b>Falix</b> 计时器时间未增加: ' + timeBefore + 's → ' + timeAfter + 's (ext=' + ext + ')');
+              await tg(`⚠️ <b>Falix [${ACC_TAG}]</b> 计时器时间未增加: ` + timeBefore + 's → ' + timeAfter + 's (ext=' + ext + ')');
               console.log('timer extend failed (time unchanged, ext=' + ext + ')');
             } else {
-              await tg('⚠️ <b>Falix</b> 计时器续期失败: <code>' + ext + '</code>（' + timeBefore + '→' + timeAfter + '）');
+              await tg(`⚠️ <b>Falix [${ACC_TAG}]</b> 计时器续期失败: <code>` + ext + '</code>（' + timeBefore + '→' + timeAfter + '）');
               console.log('timer extend failed: ' + ext);
             }
           } catch (e) {
             const msg = (e && e.message) ? e.message : String(e);
-            console.error('error: ' + msg);
+            console.error(`[${ACC_TAG}] error: ` + msg);
             await shot(page, 'error').catch(() => {});
-            await tg('❌ <b>Falix</b> 出错: ' + msg);
+            await tg(`❌ <b>Falix [${ACC_TAG}]</b> 出错: ` + msg);
             const retryable = /ProtocolError|timed out|Target closed|Connection closed|Session closed/i.test(msg);
             process.exit(retryable ? 2 : 1);
           } finally {
@@ -1340,11 +1352,16 @@ jobs:
 
       - name: Run script
         env:
+          ACCOUNT_INDEX: ${{ matrix.account }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
-          FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
-          FALIX_SERVER_ID: ${{ secrets.FALIX_SERVER_ID }}
-          FALIX_COOKIES: ${{ secrets.FALIX_COOKIES }}
+          FALIX_EMAIL_1: ${{ secrets.FALIX_EMAIL }}
+          FALIX_PASSWORD_1: ${{ secrets.FALIX_PASSWORD }}
+          FALIX_SERVER_ID_1: ${{ secrets.FALIX_SERVER_ID }}
+          FALIX_COOKIES_1: ${{ secrets.FALIX_COOKIES }}
+          FALIX_EMAIL_2: ${{ secrets.FALIX_EMAIL_2 }}
+          FALIX_PASSWORD_2: ${{ secrets.FALIX_PASSWORD_2 }}
+          FALIX_SERVER_ID_2: ${{ secrets.FALIX_SERVER_ID_2 }}
+          FALIX_COOKIES_2: ${{ secrets.FALIX_COOKIES_2 }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           COOKIES_PATH: ${{ github.workspace }}/cookies.json
@@ -1369,7 +1386,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: screenshots
+          name: screenshots-acc${{ matrix.account }}
           path: /tmp/ss/
           retention-days: 3
 
@@ -1378,10 +1395,10 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: cookies.json
-          key: falix-cookies-${{ github.run_id }}
+          key: falix-cookies-${{ matrix.account }}-${{ github.run_id }}
 
       - name: Cleanup old runs
-        if: always()
+        if: always() && matrix.account == 1
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
